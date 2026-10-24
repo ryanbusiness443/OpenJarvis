@@ -286,3 +286,160 @@ class TestEndToEnd:
         assert lines[1].endswith("CUT")
         # The cut snaps to frames 60..90 at 29.97 fps: 1.001 s removed, not 1.000.
         assert lines[2].endswith("00:00:02.999")
+
+
+# ---------------------------------------------------------------- transitions/effects
+
+
+class TestTransitionMath:
+    def _segs(self, *lengths):
+        segs, pos = [], 0
+        for i, n in enumerate(lengths):
+            segs.append({"index": i, "src_start_frame": pos, "src_end_frame": pos + n})
+            pos += n + 100  # gaps between pieces: real cuts
+        return segs
+
+    def test_overlap_shortens_timeline_exactly(self):
+        from openjarvis.tools.video import effects
+
+        segs = self._segs(60, 60, 60)
+        segs[2]["trans_req"] = {"type": "fadeblack", "duration": "10f"}
+        findings = []
+        total = effects.apply_transitions(
+            segs,
+            {"transition": {"type": "fade", "duration": "15f"}},
+            Fraction(30),
+            findings,
+        )
+        assert total == 180 - 15 - 10
+        assert [s["out_start_frame"] for s in segs] == [0, 45, 95]
+        assert segs[1]["trans_out_frames"] == 10
+        assert not findings
+
+    def test_transition_longer_than_piece_is_reported(self):
+        from openjarvis.tools.video import effects
+
+        segs = self._segs(60, 8, 60)
+        findings = []
+        effects.apply_transitions(
+            segs,
+            {"transition": {"type": "fade", "duration": "6f"}},
+            Fraction(30),
+            findings,
+        )
+        assert any(f["code"] == "TRANSITION_TOO_LONG" for f in findings)
+
+    def test_unknown_transition_and_effect_rejected(self):
+        from openjarvis.tools.video import effects
+
+        with pytest.raises(core.ToolError):
+            effects.resolve_transition({"type": "sparkle"}, None, Fraction(30))
+        segs = self._segs(60)
+        effects.apply_transitions(segs, {}, Fraction(30), [])
+        with pytest.raises(core.ToolError):
+            effects.plan_effects(
+                {"effects": [{"type": "lensflare"}]}, segs, 60, Fraction(30), ".", []
+            )
+        with pytest.raises(core.ToolError):
+            effects.plan_effects(
+                {
+                    "effects": [
+                        {
+                            "type": "blur",
+                            "start": 0,
+                            "end": 1,
+                            "rect": [0.8, 0.8, 0.5, 0.5],
+                        }
+                    ]
+                },
+                segs,
+                60,
+                Fraction(30),
+                ".",
+                [],
+            )
+
+    def test_source_timed_effect_follows_the_cut(self):
+        from openjarvis.tools.video import effects
+
+        segs = self._segs(60, 60)  # piece 1 is source frames 160..220
+        effects.apply_transitions(segs, {}, Fraction(30), [])
+        planned = effects.plan_effects(
+            {"effects": [{"type": "zoom", "start": "170f", "end": "180f"}]},
+            segs,
+            120,
+            Fraction(30),
+            ".",
+            [],
+        )
+        assert (planned[0]["out_start_frame"], planned[0]["out_end_frame"]) == (70, 80)
+
+
+@needs_ffmpeg
+class TestTransitionsAndEffectsEndToEnd:
+    def test_render_verify_and_negative_control(self, sample_clip, tmp_path):
+        words = tmp_path / "words.json"
+        words.write_text(
+            json.dumps(
+                [
+                    {"word": "hello", "start": 0.3, "end": 0.7},
+                    {"word": "world", "start": 3.4, "end": 3.9},
+                ]
+            )
+        )
+        plan_path = tmp_path / "plan.json"
+        out = tmp_path / "fx.mp4"
+        planned = VideoPlanTool(allowed_dirs=[]).execute(
+            source=sample_clip,
+            segments=[
+                {"start": "2.15", "end": "3.05"},
+                {
+                    "start": "5.15",
+                    "end": "5.75",
+                    "transition": {"type": "wipeleft", "duration": 0.3},
+                },
+            ],
+            transition={"type": "fade", "duration": 0.4},
+            effects=[
+                {"type": "zoom", "start": "0.8", "end": "1.6", "scale": 1.3},
+                {"type": "text", "start": "6.2", "end": "7.0", "text": "Bye"},
+                {"type": "captions", "source": str(words)},
+                {"type": "fade_out", "duration": 0.3},
+            ],
+            preset="draft",
+            plan_out=str(plan_path),
+        )
+        assert planned.success, planned.content
+        assert "2 transitions" in planned.content
+
+        rendered = VideoRenderTool(allowed_dirs=[]).execute(
+            plan_path=str(plan_path), output_path=str(out)
+        )
+        assert rendered.success, rendered.content
+        verified = VideoVerifyTool(allowed_dirs=[]).execute(
+            plan_path=str(plan_path), output_path=str(out)
+        )
+        assert verified.success, verified.content
+        statuses = {
+            r["check"]: r["status"] for r in verified.metadata["report"]["checks"]
+        }
+        for check in (
+            "FRAME_COUNT",
+            "TRANSITIONS",
+            "EFFECTS",
+            "CAPTIONS",
+            "FADES",
+            "AUDIO_ALIGN",
+        ):
+            assert statuses[check] == "PASS", verified.content
+
+        # Negative control: the zoom claimed 2 frames later than rendered.
+        from openjarvis.tools.video import verifier
+
+        moved = json.loads(plan_path.read_text())
+        for eff in moved["effects"]:
+            if eff["type"] == "zoom":
+                eff["out_start_frame"] += 2
+                eff["out_end_frame"] += 2
+        bad = verifier.verify(moved, str(out), check_loudness=False)
+        assert "EFFECTS" in bad["failed"]

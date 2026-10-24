@@ -292,39 +292,3 @@ def write_srt(cues, path=None):
 
 
 # -------------------------------------------------------------------- CLI
-
-
-def _sample():
-    plan = {
-        "fps": "30",
-        "expected_duration": "290",
-        "segments": [
-            {"src_start_frame": 0, "src_end_frame": 1800, "out_start_frame": 0},
-            {"src_start_frame": 2400, "src_end_frame": 9000, "out_start_frame": 1800},
-        ],
-    }
-    chapters = [
-        (Fraction(0), "Intro"),
-        (Fraction(65), "Setup (cut from the edit)"),
-        (Fraction(95), "The build"),
-        (Fraction(200), "Results"),
-        (Fraction(295), "Outro"),
-    ]
-    cues = [
-        (Fraction(58), Fraction(62), "this sentence crosses the cut"),
-        (Fraction(70), Fraction(72), "this one was removed"),
-        (Fraction(120), Fraction(123), "and this one moves 20 s earlier"),
-    ]
-    ch = remap_chapters(plan, chapters)
-    cu, dropped = remap_cues(plan, cues)
-    tl = Timeline(plan)
-    points = {}
-    for t in (Fraction(90), Fraction(120)):
-        o = tl.map(t)
-        points[core.fmt_ts(t)] = core.fmt_ts(o) if o is not None else "CUT"
-    return {
-        "chapters": ch,
-        "captions_srt": write_srt(cu),
-        "captions_dropped": dropped,
-        "points": points,
-    }

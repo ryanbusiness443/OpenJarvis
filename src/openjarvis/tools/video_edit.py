@@ -7,7 +7,8 @@ subprocess, exact ``Fraction`` time arithmetic):
                           A/V offset, keyframe spacing)
 - ``video_analyze``       silences, black segments, scene changes, loudness
 - ``video_propose_cuts``  padded, word-safe cut proposals written as an EDL
-- ``video_plan``          EDL (file or inline segments) -> frame/sample-exact plan
+- ``video_plan``          EDL (file or inline segments, transitions, effects)
+                          -> frame/sample-exact plan
 - ``video_render``        plan -> MP4 in one decode pass (never stream copy)
 - ``video_verify``        plan + render -> PASS/FAIL with per-cut frame matching
 - ``video_remap``         chapters / captions / timestamps through the edit
@@ -29,6 +30,22 @@ from openjarvis.tools._paths import resolve_allowed_dirs
 from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 _MAX_LISTED = 40
+
+_TRANSITION_DOC = (
+    "Default transition between pieces, e.g. {type: fade, duration: 0.4}. Types: "
+    "cut (default), fade, dissolve, fadeblack, fadewhite, wipeleft, slideup, "
+    "circleopen, zoomin and other ffmpeg xfade styles. A segment may carry its own "
+    "transition to override it."
+)
+_EFFECTS_DOC = (
+    "Effects. Source-timed: {type: zoom, start, end, scale, center:[x,y]}, "
+    "{type: text, start, end, text, position: top|center|bottom}, "
+    "{type: blur, start, end, rect:[x,y,w,h]}. Whole video: {type: color, "
+    "brightness, contrast, saturation}, {type: lut, file}, {type: captions, "
+    "source, style: youtube|shorts}, {type: music, file, volume_db, duck}, "
+    "{type: fade_in, duration}, {type: fade_out, duration}. Only add effects the "
+    "user asked for."
+)
 
 
 class _VideoTool(BaseTool):
@@ -348,6 +365,12 @@ class VideoPlanTool(_VideoTool):
                         "type": "string",
                         "description": "Word-timestamp JSON; enables MID_WORD checks.",
                     },
+                    "transition": {"type": "object", "description": _TRANSITION_DOC},
+                    "effects": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": _EFFECTS_DOC,
+                    },
                     "snap_words": {
                         "type": "boolean",
                         "description": "Move cuts out of words (default true).",
@@ -390,6 +413,16 @@ class VideoPlanTool(_VideoTool):
             edl_dir = os.getcwd()
         else:
             return self._fail("Provide edl_path, or source + segments.")
+        if params.get("transition") is not None:
+            edl["transition"] = params["transition"]
+        if params.get("effects") is not None:
+            edl["effects"] = params["effects"]
+        for eff in edl.get("effects") or []:
+            for key in ("file", "source", "fontfile"):
+                if eff.get(key):
+                    f = eff[key]
+                    f = f if os.path.isabs(f) else os.path.join(edl_dir, f)
+                    eff[key] = str(self._path(f, f"effect {key}"))
         src = edl.get("source", "")
         if not os.path.isabs(src):
             src = os.path.normpath(os.path.join(edl_dir, src))
@@ -415,6 +448,12 @@ class VideoPlanTool(_VideoTool):
             f"{plan['expected_duration_ts']} · removed {plan['removed_s']}s · "
             f"fps {plan['fps']}",
         ]
+        trans = [s for s in plan["segments"] if s.get("trans_in_frames")]
+        if trans or plan["effects"]:
+            lines.append(
+                f"{len(trans)} transitions · effects: "
+                + (", ".join(e["type"] for e in plan["effects"]) or "none")
+            )
         if plan["findings"]:
             lines.append(_findings_text(plan["findings"]))
         return self._ok(
@@ -436,8 +475,9 @@ class VideoRenderTool(_VideoTool):
         return ToolSpec(
             name="video_render",
             description=(
-                "Render a plan to MP4: frame-exact cuts in one pass (never stream "
-                "copy), click-free audio, loudness normalized to -14 LUFS / -1 dBTP, "
+                "Render a plan to MP4: frame-exact cuts (never stream copy), "
+                "transitions and effects from the plan, click-free audio, loudness "
+                "normalized to -14 LUFS / -1 dBTP, "
                 "YouTube's recommended H.264/AAC settings. Never writes over the "
                 "source. Always run video_verify afterwards."
             ),
@@ -512,7 +552,9 @@ class VideoVerifyTool(_VideoTool):
             description=(
                 "Verify a render against its plan: exact frame count and rate, A/V "
                 "sync, audio cross-correlation per piece (1 ms), the frame after every "
-                "cut matched against the source, loudness, and YouTube upload spec. "
+                "cut matched against the source, transitions rebuilt and compared, "
+                "effects on/off at their edge frames, burned captions, loudness, and "
+                "YouTube upload spec. "
                 "An edit is not done until this returns PASS."
             ),
             parameters={

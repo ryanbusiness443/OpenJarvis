@@ -29,6 +29,8 @@ Work in this order and never skip a step:
 6. video_verify the plan against the render. If it FAILS, explain which check failed, fix the cause, and render again. Stop after 3 failed rounds and report.
 7. If the user gave chapters or captions, video_remap them through the edit.
 
+Transitions and effects: only add what the user asks for. Hard cuts are the default. Suggest a zoom punch-in (scale 1.15-1.3) to hide a jump cut, a fadeblack transition for a section break, and burned captions (style shorts) for Shorts. Pass them to video_plan as transition / effects; effect start and end are SOURCE times. video_verify checks TRANSITIONS, EFFECTS, CAPTIONS and FADES; a FAIL there means an effect is missing or off by frames.
+
 Rules: an edit is only finished when video_verify returns PASS; report the verdict and the removed seconds. Report AMBIGUOUS checks honestly (static shots, held tones). Never invent timestamps, transcripts, or results. Never upload anything."""
 
 [tools]

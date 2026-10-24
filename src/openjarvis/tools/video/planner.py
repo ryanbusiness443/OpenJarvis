@@ -17,6 +17,7 @@ import os
 from fractions import Fraction
 
 from openjarvis.tools.video import core
+from openjarvis.tools.video import effects as fx
 
 PRESETS = {
     # name: (max width, max height, crf, x264 preset, audio kbps per stereo pair)
@@ -53,7 +54,7 @@ PRESETS = {
         "size": (1280, 720),
         "crf": 28,
         "x264": "veryfast",
-        "audio_kbps": 128,
+        "audio_kbps": 192,
         "note": "fast preview; not for upload",
     },
 }
@@ -171,7 +172,15 @@ def build_plan(
                 % (i, core.fmt_ts(b), core.fmt_ts(duration)),
             )
             b = duration
-        ranges.append({"a": a, "b": b, "label": label, "i": i})
+        ranges.append(
+            {
+                "a": a,
+                "b": b,
+                "label": label,
+                "i": i,
+                "transition": seg.get("transition"),
+            }
+        )
 
     if mode == "keep" and [r["i"] for r in ranges] != [
         r["i"] for r in sorted(ranges, key=lambda r: r["a"])
@@ -205,15 +214,19 @@ def build_plan(
 
     # 2. Convert cut mode into keep ranges.
     if mode == "cut":
-        keeps, cursor = [], Fraction(0)
+        # A cut's "transition" applies to the join it creates, i.e. into the
+        # keep that follows it.
+        keeps, cursor, pending = [], Fraction(0), None
         for r in ranges:
             if r["a"] - cursor > 0:
                 keeps.append(
-                    {"a": cursor, "b": r["a"], "label": "", "cut_after": r["label"]}
+                    {"a": cursor, "b": r["a"], "label": "", "transition": pending}
                 )
-            cursor = r["b"]
+            cursor, pending = r["b"], r.get("transition")
         if duration - cursor > 0:
-            keeps.append({"a": cursor, "b": duration, "label": ""})
+            keeps.append(
+                {"a": cursor, "b": duration, "label": "", "transition": pending}
+            )
         cut_lengths = [r["b"] - r["a"] for r in ranges]
         for r, length in zip(ranges, cut_lengths):
             if length * fps < 3:
@@ -303,7 +316,12 @@ def build_plan(
                 )
             continue
         segments.append(
-            {"src_start_frame": fa, "src_end_frame": fb, "label": r["label"]}
+            {
+                "src_start_frame": fa,
+                "src_end_frame": fb,
+                "label": r["label"],
+                "trans_req": r.get("transition"),
+            }
         )
 
     # Merge keeps that became contiguous after snapping (no cut between them).
@@ -322,16 +340,16 @@ def build_plan(
     if not segments:
         _finding(findings, "block", "EMPTY_RESULT", "the edit leaves nothing to render")
 
-    # 4. Output timeline + sample-exact audio boundaries derived from it.
+    # 4. Output timeline (transitions overlap pieces) + sample-exact audio
+    #    boundaries derived from it.
     sr = audio["sample_rate"] if audio else 0
     a_start = core.to_fraction(audio["start_time"]) if audio else Fraction(0)
-    out_frame = 0
     for idx, s in enumerate(segments):
-        n = s["src_end_frame"] - s["src_start_frame"]
         s["index"] = idx
-        s["frames"] = n
-        s["out_start_frame"] = out_frame
-        s["out_end_frame"] = out_frame + n
+    total_frames = fx.apply_transitions(segments, edl, fps, findings)
+    for idx, s in enumerate(segments):
+        n = s["frames"]
+        out_frame = s["out_start_frame"]
         s["src_start"] = core.fmt_ts(core.frame_time(s["src_start_frame"], fps), 6)
         s["src_end"] = core.fmt_ts(core.frame_time(s["src_end_frame"], fps), 6)
         s["out_start"] = core.fmt_ts(core.frame_time(out_frame, fps), 6)
@@ -357,7 +375,7 @@ def build_plan(
                 % (idx, s["src_start"], n),
                 "extend it or cut it",
             )
-        out_frame += n
+    out_frame = total_frames
 
     if max_snap:
         _finding(
@@ -387,6 +405,8 @@ def build_plan(
             "%s output must be <= %ss; this edit is %.2fs"
             % (preset, max_d, float(total_dur)),
         )
+
+    effects = fx.plan_effects(edl, segments, out_frame, fps, edl_dir, findings)
 
     audio_cfg = dict(edl.get("audio") or {})
     audio_cfg.setdefault("crossfade_ms", 12)
@@ -423,5 +443,7 @@ def build_plan(
         "audio": audio_cfg,
         "output": out_cfg,
         "words": wpath and os.path.abspath(wpath),
+        "transition_default": edl.get("transition") or "cut",
+        "effects": effects,
         "findings": findings,
     }

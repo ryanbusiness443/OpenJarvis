@@ -39,6 +39,25 @@ Then it verifies the render and reports the result.
 Presets: `youtube` (native size), `youtube-720p`, `youtube-1080p`, `youtube-1440p`, `youtube-4k`,
 `youtube-shorts` (9:16 centre crop, 3-minute limit), `draft` (fast preview).
 
+## Transitions and effects
+
+Ask for them in plain language ("crossfade between sections, zoom in at 2:10, burn captions
+for the Short"). The agent passes them to `video_plan`:
+
+| Kind | Options |
+|---|---|
+| Transitions | `cut` (default), `fade`, `dissolve`, `fadeblack`, `fadewhite`, wipes, slides, `circleopen`, `zoomin` and the rest of ffmpeg's 50+ `xfade` styles; a default plus per-cut overrides |
+| Source-timed effects | `zoom` punch-in, `text` overlay, `blur` region. They move with the content when cuts change |
+| Whole-video effects | `color`, `lut` (.cube), burned-in `captions` (`youtube` / `shorts` style), `music` bed ducked under the voice, `fade_in`, `fade_out` |
+
+A transition overlaps two pieces, so the edit gets shorter by exactly its length, and the audio
+crossfade covers exactly the same samples. `video_verify` then proves the styling:
+
+- **Transitions:** the middle frame of each transition is rebuilt from the source with the same `xfade` and compared.
+- **Effects:** each effect must be on at its first and last frame and off just outside them.
+- **Captions:** burned captions are re-rendered onto source frames at the matching time and compared.
+- **Fades:** the first and last frames are checked for black.
+
 ## Word timestamps
 
 Word-level timestamps enable word-safe cuts, filler removal and captions without the removed
@@ -52,7 +71,9 @@ On synthetic test clips with a frame counter and known audio events:
 - 61-piece 1080p edit: 4080/4080 frames, 100/100 cut boundaries at offset 0, worst audio lag 0.0 ms.
 - Beeps at known times through three cuts and a 44.1 → 48 kHz resample: within one sample.
 - Source whose audio starts 278 ms after the video: worst audio error 0.06 ms.
-- A render with audio 10 ms late, or a plan shifted by one frame, is caught as FAIL.
+- 20 transitions in 8 styles at 1080p: every frame present, every cut exact.
+- A render with audio 10 ms late, a plan shifted by one frame, a zoom claimed 2 frames late, or
+  a hard cut where the plan says crossfade: each is caught as FAIL.
 
 ## Safety
 

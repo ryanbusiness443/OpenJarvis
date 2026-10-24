@@ -9,13 +9,15 @@ upload spec. Static shots and periodic audio report AMBIGUOUS, not PASS.
 from __future__ import annotations
 
 import os
-import re
 import struct
+import tempfile
 from fractions import Fraction
 
 from openjarvis.tools.video import core
+from openjarvis.tools.video import effects as fx
 
 MATCH_MAX_MAD = 12.0  # best-match thumbnail difference above this = wrong content
+TEXT_THUMB = (192, 108)  # text and captions are checked at 3x thumbnail size
 AMBIGUITY_MARGIN = 0.75  # best and runner-up closer than this = static shot
 
 
@@ -58,50 +60,78 @@ def mp4_box_order(path):
 
 
 def measure_loudness(path):
-    ffmpeg, _ = core.require_ffmpeg()
-    err = core.run(
-        [
-            ffmpeg,
-            "-hide_banner",
-            "-nostdin",
-            "-i",
-            path,
-            "-map",
-            "0:a:0",
-            "-af",
-            "ebur128=peak=true",
-            "-f",
-            "null",
-            "-",
-        ]
-    ).stderr.decode("utf-8", "replace")
-    summary = err[err.rfind("Summary:") :]
-    out = {}
-    for key, pat in (
-        ("integrated_lufs", r"I:\s+(-?[\d.]+) LUFS"),
-        ("true_peak_dbtp", r"Peak:\s+(-?[\d.]+|-inf) dBFS"),
-        ("lra_lu", r"LRA:\s+([\d.]+) LU"),
-    ):
-        m = re.search(pat, summary)
-        if m:
-            out[key] = None if m.group(1) == "-inf" else float(m.group(1))
-    return out
+    return core.measure_loudness(path)
 
 
-def _src_vf(plan):
-    """Geometry transform the renderer applied, so thumbnails compare alike."""
-    from openjarvis.tools.video.planner import PRESETS
+class _Ctx:
+    """Everything the frame checks share: geometry, masks, and busy frames."""
 
-    cfg = PRESETS.get(plan["output"].get("preset", "youtube"), {})
-    if cfg.get("fill") == "crop" and cfg.get("size"):
-        w, h = cfg["size"]
-        return "crop='min(iw\\,ih*%d/%d)':'min(ih\\,iw*%d/%d)'" % (w, h, h, w)
-    return None
+    def __init__(self, plan, tmpdir):
+        from openjarvis.tools.video.planner import PRESETS
+
+        self.plan = plan
+        self.fps = core.to_fraction(plan["fps"])
+        self.tmp = tmpdir
+        self.effects = plan.get("effects") or []
+        self.info = core.probe(plan["source"])
+        cfg = PRESETS.get(plan["output"].get("preset", "youtube"), {})
+        self.geo, self.size = fx.geometry_filters(self.info, cfg)
+        self.color = fx.color_filters(self.effects)
+        self.base_vf = ",".join(self.geo + self.color)
+        cap = next((e for e in self.effects if e["type"] == "captions"), None)
+        # Burned captions are re-rendered onto source frames at the matching
+        # output time, so comparisons stay full-frame and exact.
+        self.cap_filter = (
+            fx.captions_filter(plan, cap, tmpdir, self.size)[0] if cap else None
+        )
+        self.busy = {}  # out frame -> why it cannot match a plain source frame
+        total = plan["total_frames"]
+        for e in self.effects:
+            if "out_start_frame" in e:
+                for f in range(e["out_start_frame"], e["out_end_frame"]):
+                    self.busy.setdefault(f, "%s effect" % e["type"])
+            elif e["type"] == "fade_in":
+                for f in range(0, e["frames"]):
+                    self.busy.setdefault(f, "fade in")
+            elif e["type"] == "fade_out":
+                for f in range(total - e["frames"], total):
+                    self.busy.setdefault(f, "fade out")
+        for sgm in plan["segments"]:
+            for f in range(
+                sgm["out_start_frame"],
+                sgm["out_start_frame"] + sgm["trans_in_frames"]
+                if sgm.get("trans_in_frames")
+                else sgm["out_start_frame"],
+            ):
+                self.busy.setdefault(f, "transition")
+
+    def src_frame(self, o):
+        """Source frame shown at output frame o outside transitions, or None."""
+        for sgm in self.plan["segments"]:
+            lo = sgm["out_start_frame"] + sgm.get("trans_in_frames", 0)
+            hi = sgm["out_end_frame"] - sgm.get("trans_out_frames", 0)
+            if lo <= o < hi:
+                return sgm["src_start_frame"] + (o - sgm["out_start_frame"])
+        return None
+
+    def mad(self, a, b):
+        return core.mad(a, b)
+
+    def src_vf(self, out_frame, captions=True):
+        """Source-frame filter: geometry + colour, plus captions as of out_frame."""
+        vf = self.base_vf
+        if captions and self.cap_filter:
+            vf += ",setpts=%.9f/TB,%s" % (
+                float(core.frame_time(out_frame, self.fps)),
+                self.cap_filter,
+            )
+        return vf
 
 
-def _grab(path, first, count, fps, vf=None):
+def _grab(path, first, count, fps, vf=None, size=None):
+    tw, th = size or (core.THUMB_W, core.THUMB_H)
     if vf is None:
-        return core.grab_frames(path, first, count, fps)
+        return core.grab_frames(path, first, count, fps, size=size)
     ffmpeg, _ = core.require_ffmpeg()
     first = max(0, first)
     seek = (Fraction(first) - Fraction(1, 2)) / fps if first else Fraction(0)
@@ -118,23 +148,25 @@ def _grab(path, first, count, fps, vf=None):
         "-frames:v",
         str(count),
         "-vf",
-        "%s,scale=%d:%d:flags=area,format=gray" % (vf, core.THUMB_W, core.THUMB_H),
+        "%s,scale=%d:%d:flags=area,format=gray" % (vf, tw, th),
         "-f",
         "rawvideo",
         "-",
     ]
     raw = core.run(cmd).stdout
-    size = core.THUMB_W * core.THUMB_H
-    return [raw[i : i + size] for i in range(0, len(raw) - size + 1, size)]
+    n = tw * th
+    return [raw[i : i + n] for i in range(0, len(raw) - n + 1, n)]
 
 
-def _match(out_thumb, src_path, center, fps, vf, src_frames, radius=2):
+def _match(ctx, out_thumb, center, out_frame, radius=2):
     """Offset (-radius..radius) of the source frame best matching out_thumb."""
     first = max(0, center - radius)
-    last = min(src_frames - 1, center + radius)
-    thumbs = _grab(src_path, first, last - first + 1, fps, vf)
+    last = min(ctx.plan["source_frames"] - 1, center + radius)
+    thumbs = _grab(
+        ctx.plan["source"], first, last - first + 1, ctx.fps, ctx.src_vf(out_frame)
+    )
     scored = sorted(
-        (core.mad(out_thumb, t), first + i - center) for i, t in enumerate(thumbs)
+        (ctx.mad(out_thumb, t), first + i - center) for i, t in enumerate(thumbs)
     )
     if not scored:
         return None
@@ -235,8 +267,13 @@ def verify_audio(plan, out_path, max_pieces=12):
     pad = Fraction(max_lag, AUDIO_RATE)
     rows = []
     for s in segs:
-        dur = Fraction(s["frames"]) / fps
-        mid = (dur - AUDIO_WINDOW) / 2
+        # Centre the window in the piece's clean part (clear of transitions).
+        t_in = core.frame_time(s.get("trans_in_frames", 0), fps)
+        t_out = core.frame_time(s.get("trans_out_frames", 0), fps)
+        clean = Fraction(s["frames"]) / fps - t_in - t_out
+        if clean < AUDIO_WINDOW + Fraction(1, 10):
+            continue
+        mid = t_in + (clean - AUDIO_WINDOW) / 2
         src_t = core.frame_time(s["src_start_frame"], fps) + mid
         out_t = core.frame_time(s["out_start_frame"], fps) + mid
         if src_t + v_start - pad < a_start:
@@ -286,34 +323,26 @@ def verify_audio(plan, out_path, max_pieces=12):
     return rows
 
 
-def verify_cuts(plan, out_path, max_cuts=50):
-    fps = core.to_fraction(plan["fps"])
-    segs = plan["segments"]
-    src = plan["source"]
-    vf = _src_vf(plan)
+def verify_cuts(ctx, out_path, max_cuts=50):
+    """Match the first and last *clean* frame of every piece against the source."""
     probes = []  # (label, out_frame, src_frame)
-    for s in segs:
-        probes.append(
-            (
-                "start of piece %d" % s["index"],
-                s["out_start_frame"],
-                s["src_start_frame"],
-            )
-        )
-        probes.append(
-            (
-                "end of piece %d" % s["index"],
-                s["out_end_frame"] - 1,
-                s["src_end_frame"] - 1,
-            )
-        )
+    for s in ctx.plan["segments"]:
+        first = s["out_start_frame"] + s.get("trans_in_frames", 0)
+        last = s["out_end_frame"] - 1 - s.get("trans_out_frames", 0)
+        for label, of in (
+            ("start of piece %d" % s["index"], first),
+            ("end of piece %d" % s["index"], last),
+        ):
+            if of in ctx.busy:
+                continue  # an effect covers it; EFFECTS checks that frame instead
+            probes.append((label, of, ctx.src_frame(of)))
     if max_cuts and len(probes) > max_cuts * 2:
         step = len(probes) / float(max_cuts * 2)
         probes = [probes[int(i * step)] for i in range(max_cuts * 2)]
     results = []
     for label, of, sf in probes:
-        thumbs = core.grab_frames(out_path, of, 1, fps)
-        if not thumbs:
+        thumbs = core.grab_frames(out_path, of, 1, ctx.fps)
+        if not thumbs or sf is None:
             results.append(
                 {
                     "where": label,
@@ -324,7 +353,7 @@ def verify_cuts(plan, out_path, max_cuts=50):
                 }
             )
             continue
-        m = _match(thumbs[0], src, sf, fps, vf, plan["source_frames"])
+        m = _match(ctx, thumbs[0], sf, of)
         if m is None:
             status = "FAIL"
         elif m["mad"] > MATCH_MAX_MAD:
@@ -343,6 +372,247 @@ def verify_cuts(plan, out_path, max_cuts=50):
             }
         )
     return results
+
+
+def _thumb_out(ctx, out_path, o, size=None):
+    t = core.grab_frames(out_path, o, 1, ctx.fps, size=size)
+    return t[0] if t else None
+
+
+def _thumb_src(ctx, sf, out_frame, effect=None, captions=True, size=None):
+    vf = ctx.src_vf(out_frame, captions)
+    if effect is not None:
+        vf = "%s[g];%s;[x]null" % (
+            vf,
+            fx.local_effect_graph(effect, ctx.size, "g", "x", ctx.tmp, enable=False),
+        )
+    t = _grab(ctx.plan["source"], sf, 1, ctx.fps, vf, size)
+    return t[0] if t else None
+
+
+def verify_effects(ctx, out_path):
+    """Each local effect is present on its first and last frame, absent just outside."""
+    rows = []
+    total = ctx.plan["total_frames"]
+    local = [e for e in ctx.effects if "out_start_frame" in e]
+    for e in local:
+        a, b = e["out_start_frame"], e["out_end_frame"]
+        for o, inside in ((a, True), (b - 1, True), (a - 1, False), (b, False)):
+            if o < 0 or o >= total:
+                continue
+            others = [
+                x
+                for x in local
+                if x is not e and x["out_start_frame"] <= o < x["out_end_frame"]
+            ]
+            sf = ctx.src_frame(o)
+            reason = ctx.busy.get(o) if not inside else None
+            if (
+                sf is None
+                or others
+                or (reason and not reason.endswith("effect"))
+                or (not inside and reason)
+            ):
+                rows.append(
+                    {
+                        "effect": e["type"],
+                        "index": e["index"],
+                        "out_frame": o,
+                        "expect": "on" if inside else "off",
+                        "status": "SKIP",
+                    }
+                )
+                continue
+            size = TEXT_THUMB if e["type"] == "text" else None
+            out_t = _thumb_out(ctx, out_path, o, size)
+            plain = _thumb_src(ctx, sf, o, size=size)
+            with_fx = _thumb_src(ctx, sf, o, e, size=size)
+            d_fx, d_plain = ctx.mad(out_t, with_fx), ctx.mad(out_t, plain)
+            near, far = (d_fx, d_plain) if inside else (d_plain, d_fx)
+            if abs(d_fx - d_plain) < 0.5:
+                status = "AMBIGUOUS"
+            else:
+                status = (
+                    "PASS" if near <= MATCH_MAX_MAD and near + 0.5 < far else "FAIL"
+                )
+            rows.append(
+                {
+                    "effect": e["type"],
+                    "index": e["index"],
+                    "out_frame": o,
+                    "expect": "on" if inside else "off",
+                    "status": status,
+                    "mad_with_effect": round(d_fx, 2),
+                    "mad_without": round(d_plain, 2),
+                }
+            )
+    return rows
+
+
+def _expected_transition_frame(ctx, prev, cur, k):
+    """Re-create transition frame k by running the same xfade on the source pieces."""
+    ffmpeg, _ = core.require_ffmpeg()
+    fps, d = ctx.fps, cur["trans_in_frames"]
+    a0 = prev["src_start_frame"] + (cur["out_start_frame"] - prev["out_start_frame"])
+    b0 = cur["src_start_frame"]
+    cmd = [ffmpeg, "-v", "error", "-nostdin"]
+    for f0 in (a0, b0):
+        if f0:
+            cmd += ["-ss", "%.9f" % float((Fraction(f0) - Fraction(1, 2)) / fps)]
+        cmd += ["-i", ctx.plan["source"]]
+    piece = "trim=end_frame=%d,settb=%d/%d,setpts=N,%s,format=yuv420p" % (
+        d + 1,
+        fps.denominator,
+        fps.numerator,
+        ",".join(ctx.geo),
+    )
+    post = list(ctx.color)
+    if ctx.cap_filter:
+        m = cur["out_start_frame"] + k
+        post += ["setpts=%.9f/TB" % float(core.frame_time(m, fps)), ctx.cap_filter]
+    graph = (
+        "[0:v:0]%s[a];[1:v:0]%s[b];[a][b]xfade=transition=%s:duration=%.9f:offset=0,"
+        "select='eq(n\\,%d)',%sscale=%d:%d:flags=area,format=gray[o]"
+        % (
+            piece,
+            piece,
+            cur["trans_in_type"],
+            float(core.frame_time(d, fps)),
+            k,
+            "".join(f + "," for f in post),
+            core.THUMB_W,
+            core.THUMB_H,
+        )
+    )
+    cmd += [
+        "-filter_complex",
+        graph,
+        "-map",
+        "[o]",
+        "-fps_mode",
+        "passthrough",
+        "-frames:v",
+        "1",
+        "-f",
+        "rawvideo",
+        "-",
+    ]
+    raw = core.run(cmd).stdout
+    size = core.THUMB_W * core.THUMB_H
+    return raw[:size] if len(raw) >= size else None
+
+
+def verify_transitions(ctx, out_path):
+    """Mid-transition frames must match the same transition rebuilt from the source."""
+    rows = []
+    segs = ctx.plan["segments"]
+    for i, s in enumerate(segs):
+        d = s.get("trans_in_frames", 0)
+        if not d or i == 0:
+            continue
+        prev = segs[i - 1]
+        k = d // 2
+        m = s["out_start_frame"] + k
+        a_src = prev["src_start_frame"] + (m - prev["out_start_frame"])
+        b_src = s["src_start_frame"] + k
+        out_t = _thumb_out(ctx, out_path, m)
+        expected = _expected_transition_frame(ctx, prev, s, k)
+        ta, tb = _thumb_src(ctx, a_src, m), _thumb_src(ctx, b_src, m)
+        de, da, db = ctx.mad(out_t, expected), ctx.mad(out_t, ta), ctx.mad(out_t, tb)
+        if de > MATCH_MAX_MAD:
+            status = "FAIL"
+        elif de + 0.5 < min(da, db):
+            status = "PASS"  # matches the rebuilt transition better than either piece
+        else:
+            status = (
+                "AMBIGUOUS"
+                if ctx.mad(ta, tb) < 3
+                or ctx.mad(expected, ta) < 1
+                or ctx.mad(expected, tb) < 1
+                else "FAIL"
+            )
+        rows.append(
+            {
+                "into_piece": i,
+                "type": s["trans_in_type"],
+                "frames": d,
+                "mid_frame": m,
+                "status": status,
+                "mad_vs_expected": round(de, 2),
+                "mad_vs_outgoing": round(da, 2),
+                "mad_vs_incoming": round(db, 2),
+            }
+        )
+    return rows
+
+
+def verify_fades(ctx, out_path):
+    rows = []
+    total = ctx.plan["total_frames"]
+    for e in ctx.effects:
+        if e["type"] not in ("fade_in", "fade_out"):
+            continue
+        o = 0 if e["type"] == "fade_in" else total - 1
+        t = _thumb_out(ctx, out_path, o)
+        mean = sum(t) / len(t) if t else 255
+        rows.append(
+            {
+                "effect": e["type"],
+                "frame": o,
+                "mean_luma": round(mean, 1),
+                "status": "PASS" if mean <= 24 else "FAIL",
+            }
+        )
+    return rows
+
+
+def verify_captions(ctx, out_path, max_cues=6):
+    """Burned captions: right text at the right output time, nothing between."""
+    if not ctx.cap_filter:
+        return []
+    cap = next(e for e in ctx.effects if e["type"] == "captions")
+    cues = fx.build_caption_cues(ctx.plan, cap)
+    rows = []
+    picks = (
+        cues
+        if len(cues) <= max_cues
+        else [cues[int(i * len(cues) / max_cues)] for i in range(max_cues)]
+    )
+    probes = [(core.frame_of((a + b) / 2, ctx.fps), True, body) for a, b, body in picks]
+    for (a1, b1, _), (a2, _b2, _) in zip(cues, cues[1:]):
+        if a2 - b1 > 3 / ctx.fps:
+            probes.append((core.frame_of((b1 + a2) / 2, ctx.fps), False, ""))
+            break
+    for o, expect_text, body in probes:
+        sf = ctx.src_frame(o)
+        if sf is None or o in ctx.busy:
+            continue
+        out_t = _thumb_out(ctx, out_path, o, TEXT_THUMB)
+        d_cap = ctx.mad(out_t, _thumb_src(ctx, sf, o, size=TEXT_THUMB))
+        d_plain = ctx.mad(
+            out_t, _thumb_src(ctx, sf, o, captions=False, size=TEXT_THUMB)
+        )
+        if d_cap > MATCH_MAX_MAD:
+            status = "FAIL"
+        elif not expect_text:
+            status = "PASS" if abs(d_cap - d_plain) < 0.5 else "FAIL"
+        elif d_cap + 0.5 < d_plain:
+            status = "PASS"
+        elif d_plain + 0.5 < d_cap:
+            status = "FAIL"  # looks uncaptioned
+        else:
+            status = "AMBIGUOUS"  # text too small to separate at this resolution
+        rows.append(
+            {
+                "out_frame": o,
+                "expect": "text" if expect_text else "clear",
+                "mad_with_captions": round(d_cap, 2),
+                "mad_without": round(d_plain, 2),
+                "status": status,
+                "cue": body[:40],
+            }
+        )
+    return rows
 
 
 def verify(plan, out_path, max_cuts=50, check_loudness=True):
@@ -421,27 +691,61 @@ def verify(plan, out_path, max_cuts=50, check_loudness=True):
             status=None if audio_rows else "SKIP",
         )
 
-    cut_rows = []
+    cut_rows, fx_rows = [], {}
     if plan["has_video"] and v and max_cuts != 0:
-        cut_rows = verify_cuts(plan, out_path, max_cuts)
-        fails = [r for r in cut_rows if r["status"] == "FAIL"]
-        amb = [r for r in cut_rows if r["status"] == "AMBIGUOUS"]
-        _check(
-            rows,
-            "CUT_FRAMES",
-            not fails,
-            "%d boundaries checked: %d exact, %d ambiguous (static shot), %d wrong%s"
-            % (
-                len(cut_rows),
-                len(cut_rows) - len(fails) - len(amb),
-                len(amb),
-                len(fails),
-                ""
-                if not fails
-                else "; first: %s offset %s mad %s"
-                % (fails[0]["where"], fails[0].get("offset"), fails[0].get("mad")),
-            ),
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(plan, tmp)
+            cut_rows = verify_cuts(ctx, out_path, max_cuts)
+            fails = [r for r in cut_rows if r["status"] == "FAIL"]
+            amb = [r for r in cut_rows if r["status"] == "AMBIGUOUS"]
+            _check(
+                rows,
+                "CUT_FRAMES",
+                not fails,
+                "%d boundaries checked: %d exact, %d ambiguous (static shot), "
+                "%d wrong%s"
+                % (
+                    len(cut_rows),
+                    len(cut_rows) - len(fails) - len(amb),
+                    len(amb),
+                    len(fails),
+                    ""
+                    if not fails
+                    else "; first: %s offset %s mad %s"
+                    % (fails[0]["where"], fails[0].get("offset"), fails[0].get("mad")),
+                ),
+            )
+            for code, fn, what in (
+                ("TRANSITIONS", verify_transitions, "transitions blended"),
+                ("EFFECTS", verify_effects, "effect edge frames"),
+                ("CAPTIONS", verify_captions, "caption probes"),
+                ("FADES", verify_fades, "fade frames"),
+            ):
+                got = fn(ctx, out_path)
+                if not got:
+                    continue
+                fx_rows[code.lower()] = got
+                bad = [r for r in got if r["status"] == "FAIL"]
+                amb = sum(1 for r in got if r["status"] == "AMBIGUOUS")
+                skip = sum(1 for r in got if r["status"] == "SKIP")
+                _check(
+                    rows,
+                    code,
+                    not bad,
+                    "%d %s: %d ok, %d ambiguous, %d skipped, %d wrong%s"
+                    % (
+                        len(got),
+                        what,
+                        len(got) - len(bad) - amb - skip,
+                        amb,
+                        skip,
+                        len(bad),
+                        ""
+                        if not bad
+                        else "; first: %s"
+                        % {k: v2 for k, v2 in bad[0].items() if k != "status"},
+                    ),
+                )
 
     if plan["has_audio"] and a and check_loudness and plan["audio"].get("loudness"):
         target = plan["audio"]["loudness"]
@@ -502,5 +806,6 @@ def verify(plan, out_path, max_cuts=50, check_loudness=True):
         "checks": rows,
         "cuts": cut_rows,
         "audio": audio_rows,
+        **fx_rows,
         "failed": [r["check"] for r in failed],
     }

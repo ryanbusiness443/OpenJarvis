@@ -390,6 +390,38 @@ def keyframes(path, limit=100000):
     return times
 
 
+def measure_loudness(path):
+    """EBU R128 integrated loudness, true peak and LRA of the first audio stream."""
+    ffmpeg, _ = require_ffmpeg()
+    err = run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-nostdin",
+            "-i",
+            path,
+            "-map",
+            "0:a:0",
+            "-af",
+            "ebur128=peak=true",
+            "-f",
+            "null",
+            "-",
+        ]
+    ).stderr.decode("utf-8", "replace")
+    summary = err[err.rfind("Summary:") :]
+    out = {}
+    for key, pat in (
+        ("integrated_lufs", r"I:\s+(-?[\d.]+) LUFS"),
+        ("true_peak_dbtp", r"Peak:\s+(-?[\d.]+|-inf) dBFS"),
+        ("lra_lu", r"LRA:\s+([\d.]+) LU"),
+    ):
+        m = re.search(pat, summary)
+        if m:
+            out[key] = None if m.group(1) == "-inf" else float(m.group(1))
+    return out
+
+
 # --------------------------------------------------------------------------
 # Raw frame access (for boundary verification)
 # --------------------------------------------------------------------------
@@ -397,13 +429,14 @@ def keyframes(path, limit=100000):
 THUMB_W, THUMB_H = 64, 36
 
 
-def grab_frames(path, first_frame, count, fps, start_time=Fraction(0)):
+def grab_frames(path, first_frame, count, fps, start_time=Fraction(0), size=None):
     """Decode `count` frames starting at frame index `first_frame` as tiny gray thumbs.
 
     Input seeking lands half a frame before the target so ffmpeg's accurate
     seek emits exactly frame `first_frame` first, regardless of keyframes.
-    Returns a list of bytes objects (THUMB_W*THUMB_H each).
+    Returns a list of bytes objects (THUMB_W*THUMB_H each, or size[0]*size[1]).
     """
+    tw, th = size or (THUMB_W, THUMB_H)
     ffmpeg, _ = require_ffmpeg()
     first_frame = max(0, first_frame)
     seek = (
@@ -424,14 +457,14 @@ def grab_frames(path, first_frame, count, fps, start_time=Fraction(0)):
         "-frames:v",
         str(count),
         "-vf",
-        "scale=%d:%d:flags=area,format=gray" % (THUMB_W, THUMB_H),
+        "scale=%d:%d:flags=area,format=gray" % (tw, th),
         "-f",
         "rawvideo",
         "-",
     ]
     raw = run(cmd).stdout
-    size = THUMB_W * THUMB_H
-    return [raw[i : i + size] for i in range(0, len(raw) - size + 1, size)]
+    n = tw * th
+    return [raw[i : i + n] for i in range(0, len(raw) - n + 1, n)]
 
 
 def mad(a, b):
