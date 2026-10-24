@@ -128,6 +128,11 @@ except ImportError:
     pass
 
 try:
+    import openjarvis.tools.video_edit  # noqa: F401
+except ImportError:
+    pass
+
+try:
     import openjarvis.tools.image_tool  # noqa: F401
 except ImportError:
     pass

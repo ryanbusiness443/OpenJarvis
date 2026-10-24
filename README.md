@@ -72,6 +72,7 @@ from the [latest release](https://github.com/open-jarvis/OpenJarvis/releases).
 | `morning-digest-mac` / `morning-digest-linux` / `morning-digest-minimal` | Spoken daily briefing from email, calendar, health, news |
 | `deep-research` | Multi-hop research across indexed docs with citations |
 | `code-assistant` | Agent with code execution, file I/O, and shell access |
+| `youtube-editor` | Frame-accurate YouTube video editing (needs ffmpeg) that verifies every cut before calling it done |
 | `scheduled-monitor` | Stateful agent on a schedule with memory |
 | `chat-simple` | Lightweight conversation, no tools |
 
@@ -83,7 +84,7 @@ jarvis connect gdrive          # one OAuth covers Gmail / Calendar / Tasks
 jarvis digest --fresh          # generate and play your first briefing
 ```
 
-Per-preset deep dives: [morning digest](https://open-jarvis.github.io/OpenJarvis/user-guide/morning-digest/) · [deep research](https://open-jarvis.github.io/OpenJarvis/user-guide/deep-research/) · [code assistant](https://open-jarvis.github.io/OpenJarvis/user-guide/code-assistant/) · [scheduled monitor](https://open-jarvis.github.io/OpenJarvis/user-guide/scheduled-monitor/) · [chat simple](https://open-jarvis.github.io/OpenJarvis/user-guide/chat-simple/) · or the full [quickstart guide](https://open-jarvis.github.io/OpenJarvis/getting-started/quickstart/).
+Per-preset deep dives: [morning digest](https://open-jarvis.github.io/OpenJarvis/user-guide/morning-digest/) · [deep research](https://open-jarvis.github.io/OpenJarvis/user-guide/deep-research/) · [code assistant](https://open-jarvis.github.io/OpenJarvis/user-guide/code-assistant/) · [scheduled monitor](https://open-jarvis.github.io/OpenJarvis/user-guide/scheduled-monitor/) · [chat simple](https://open-jarvis.github.io/OpenJarvis/user-guide/chat-simple/) · [youtube editor](https://open-jarvis.github.io/OpenJarvis/user-guide/youtube-editor/) · or the full [quickstart guide](https://open-jarvis.github.io/OpenJarvis/getting-started/quickstart/).
 
 ### Skills
 

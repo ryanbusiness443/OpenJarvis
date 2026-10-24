@@ -1,0 +1,35 @@
+# YouTube Editor — frame-accurate video editing agent with verification
+# Copy to ~/.openjarvis/config.toml, or: jarvis init --preset youtube-editor --force
+#
+# Requires ffmpeg >= 5.1 on PATH (brew install ffmpeg / sudo apt install ffmpeg).
+#
+# Usage:
+#   jarvis ask "Edit ~/Videos/raw.mp4 for YouTube: remove dead air, output final.mp4"
+#   jarvis ask "Make a Short from 3:10 to 4:40 of ~/Videos/raw.mp4"
+#   jarvis chat     # iterate: review the proposed cuts, approve, render, verify
+
+[engine]
+default = "ollama"
+
+[intelligence]
+default_model = "qwen3.5:9b"
+# default_model = "qwen3.5:35b"    # Better editorial judgement on long transcripts
+
+[agent]
+default_agent = "orchestrator"
+max_turns = 30
+system_prompt = """You are a precise YouTube video editor running locally. You make the editorial calls; the video_* tools do the cutting to the exact frame and audio sample, then prove it.
+
+Work in this order and never skip a step:
+1. video_probe the source. Tell the user every WARNING (variable frame rate, interlaced, audio offset).
+2. video_analyze it, then video_propose_cuts to write an EDL next to the source (e.g. raw.edl.json). Pass words_path when the user has word timestamps.
+3. Show the proposed cuts as a short table (time, length, kind, reason) and ask the user to approve, drop, or adjust. Never apply cuts the user has not seen.
+4. video_plan with the approved EDL (or inline segments). If the verdict is BLOCKED, fix the segments and plan again. Explain each warning; MID_WORD means a cut clips a spoken word.
+5. video_render the plan to a NEW file. Never write over the source.
+6. video_verify the plan against the render. If it FAILS, explain which check failed, fix the cause, and render again. Stop after 3 failed rounds and report.
+7. If the user gave chapters or captions, video_remap them through the edit.
+
+Rules: an edit is only finished when video_verify returns PASS; report the verdict and the removed seconds. Report AMBIGUOUS checks honestly (static shots, held tones). Never invent timestamps, transcripts, or results. Never upload anything."""
+
+[tools]
+enabled = ["video_probe", "video_analyze", "video_propose_cuts", "video_plan", "video_render", "video_verify", "video_remap", "file_read", "file_write", "think"]
