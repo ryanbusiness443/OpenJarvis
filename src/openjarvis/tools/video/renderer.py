@@ -216,14 +216,18 @@ def _audio_chain(plan, loudnorm_filter, idx=0, music_idx=None, effects=()):
     return ";\n".join(lines)
 
 
-def _gain_limiter(cfg, measured, extra_headroom_db=0.0):
+def _gain_limiter(cfg, measured, extra_headroom_db=0.0, gain_adjust_db=0.0):
     """Fallback when linear loudnorm cannot hit the target under the peak ceiling.
 
     Static gain to the target, then a lookahead limiter (delay-compensated, so
     timing is untouched) at the ceiling minus 1 dB of headroom for inter-sample
     peaks and the AAC encode. The verifier re-measures the result.
     """
-    gain = float(cfg.get("target_lufs", -14.0)) - float(measured["input_i"])
+    gain = (
+        float(cfg.get("target_lufs", -14.0))
+        - float(measured["input_i"])
+        + gain_adjust_db
+    )
     ceiling_db = float(cfg.get("true_peak_db", -1.0)) - 1.0 - extra_headroom_db
     # Limit at 4x oversampling so inter-sample peaks are caught (true-peak style).
     return (
@@ -397,12 +401,16 @@ def render(
             channels = (info.get("audio") or {}).get("channels") or 2
             kbps = cfg["audio_kbps"] if channels >= 2 else cfg["audio_kbps"] // 2
             headroom = 0.0
+            gain_adj = 0.0
             tp_target = float(lcfg.get("true_peak_db", -1.0)) if lcfg else 0.0
-            for attempt in range(3):
+            i_target = float(lcfg.get("target_lufs", -14.0)) if lcfg else 0.0
+            for attempt in range(4):
                 lfilter = None
                 if loudness and lcfg:
-                    if measured and (headroom or not _linear_possible(lcfg, measured)):
-                        lfilter = _gain_limiter(lcfg, measured, headroom)
+                    if measured and (
+                        headroom or gain_adj or not _linear_possible(lcfg, measured)
+                    ):
+                        lfilter = _gain_limiter(lcfg, measured, headroom, gain_adj)
                         report["loudness_mode"] = "gain+limiter"
                     else:
                         lfilter = _loudnorm(
@@ -448,16 +456,28 @@ def render(
                 core.run(acmd)
                 if not (loudness and lcfg and measured):
                     break
-                got = core.measure_loudness(audio_file).get("true_peak_dbtp")
+                loud = core.measure_loudness(audio_file)
+                got = loud.get("true_peak_dbtp")
+                got_i = loud.get("integrated_lufs")
                 report["audio_true_peak_dbtp"] = got
-                if got is None or got <= tp_target + 0.3:
+                report["audio_integrated_lufs"] = got_i
+                tp_ok = got is None or got <= tp_target + 0.3
+                i_ok = got_i is None or abs(got_i - i_target) <= 0.5
+                if tp_ok and i_ok:
                     break
-                headroom += got - tp_target + 0.2
+                # Limiting quiet, peaky speech costs loudness; push the gain by the
+                # measured shortfall (the limiter holds the peaks) and re-encode.
+                if not tp_ok:
+                    headroom += got - tp_target + 0.2
+                if not i_ok:
+                    gain_adj += i_target - got_i
                 report["passes"].append(
                     {
                         "pass": "audio-retry",
                         "true_peak": got,
+                        "integrated": got_i,
                         "extra_headroom_db": round(headroom, 2),
+                        "gain_adjust_db": round(gain_adj, 2),
                     }
                 )
         in_args, graph = _build(plan, info, preset, deinterlace, None, tmp, audio=False)

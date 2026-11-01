@@ -80,8 +80,16 @@ CAPTION_STYLES = {
     # libass force_style; sizes are in the subtitle's 288-line reference frame.
     "youtube": "Fontname=Sans,Fontsize=16,PrimaryColour=&H00FFFFFF,"
     "OutlineColour=&H00000000,BorderStyle=1,Outline=1.5,Shadow=0,Alignment=2,MarginV=18",
-    "shorts": "Fontname=Sans,Fontsize=13,Bold=1,PrimaryColour=&H00FFFFFF,"
-    "OutlineColour=&H00000000,BorderStyle=1,Outline=2.5,Shadow=0,Alignment=5",
+    # Lower third, clear of the face in a centre-cropped vertical frame.
+    "shorts": "Fontname=Sans,Fontsize=11,Bold=1,PrimaryColour=&H00FFFFFF,"
+    "OutlineColour=&H00000000,BorderStyle=1,Outline=2.2,Shadow=0,Alignment=2,"
+    "MarginV=56",
+}
+# How burned captions are chunked from word timestamps, per style: long-form
+# reads two lines at a time; Shorts flash a few words at a time.
+CAPTION_CHUNKS = {
+    "youtube": {"max_chars": 42, "max_lines": 2, "max_s": Fraction(9, 2)},
+    "shorts": {"max_chars": 18, "max_lines": 2, "max_s": Fraction(11, 5)},
 }
 
 
@@ -344,7 +352,11 @@ def build_caption_cues(plan, effect):
     if src.lower().endswith((".srt", ".vtt")):
         cues, _ = remap.remap_cues(plan, remap.load_cues(src))
     else:
-        cues = remap.cues_from_words(plan, core.load_words(src))
+        cues = remap.cues_from_words(
+            plan,
+            core.load_words(src),
+            **CAPTION_CHUNKS.get(effect.get("style", "youtube"), {}),
+        )
     return cues
 
 
