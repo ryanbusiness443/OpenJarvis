@@ -79,6 +79,36 @@ output by cross-correlation (`SFX_ALIGN`). The audit scores hook speed, hook vis
 longest still stretch, change rate, captions, length, sound density, CTA and loop. It is honest
 about its limit: pacing keeps viewers watching, but the idea and the first sentence decide reach.
 
+## Genres, beat sync and montages
+
+`video_viral_plan` takes a `style`, and each one changes what the edit is for:
+
+| Style | Pace | Look | Signature moves |
+|---|---|---|---|
+| `talking-head` | punchy | punch grade | hook card, pops on key words, CTA framing |
+| `motivation` | punchy | teal-orange, grain, vignette, bars on landscape | strongest line as a centre quote with an impact |
+| `storytelling` | clean pauses | moody, grain, deep vignette | a riser that ends on each story turn ("but", "then", "until"), slow push-in |
+| `day-in-life` | punchy | warm, light grain | shutter clicks on time words |
+
+With music, set `beat_sync`. Jump cuts then slide inside their pauses onto the beat, and hits
+move onto the nearest beat within 120 ms; words are never clipped. `video_detect_beats` finds
+the tempo, beats, downbeats and rises, using ffmpeg and the standard library only.
+
+For clips with no talking (a vlog day, a hype montage, a recap), `video_montage_plan` joins the
+clips and cuts every shot on a beat. Shots run faster in the song's rises and longer in its drops,
+and day-in-life clips get time cards. `video_verify` adds a `BEAT_SYNC` check: every planned cut
+must sit within half a frame of its beat, and the music must be where the plan put it (found by
+onset cross-correlation). Shifting either by two frames fails it.
+
+`video_asset_packs` finds music, sounds and colour grades with a stated licence. It covers
+built-in grades plus [OpenFilm](https://github.com/openfilm/openfilm)'s CC0 library, which needs
+`npm i -g openfilm`: about 1,200 tracks with tempo and energy, 5,400 sounds and 66 grades. A grade
+is baked into a `.cube` LUT, so it renders and verifies like any other effect; `action=pack`
+builds a genre's grade, music and sounds in one call.
+
+**Large files.** Bring footage in from Google Drive or a direct link rather than a chat upload,
+and never re-encode it to make it fit.
+
 ## Word timestamps
 
 Word-level timestamps enable word-safe cuts, filler removal and captions without the removed

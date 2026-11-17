@@ -570,3 +570,184 @@ class TestReelEndToEnd:
         )
         assert audit.success
         assert audit.metadata["report"]["score"] >= 75
+
+
+# ---------------------------------------------------------------- beats, packs, montage
+
+
+def _click_track(path, bpm=120.0, secs=10.0):
+    """Kick on every beat (accented on 1), hats on the offbeat, a pink-noise bed."""
+    p = 60.0 / bpm
+    kick = (
+        f"(lt(mod(t,{p}),0.06)*sin(2*PI*55*t)*exp(-40*mod(t,{p}))"
+        f"*(1+0.8*lt(mod(t,{4 * p}),0.06)))"
+    )
+    hat = f"(lt(mod(t+{p / 2},{p}),0.02)*0.25*sin(2*PI*7000*t))"
+    core.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+            f"aevalsrc='0.6*{kick}+{hat}':s=44100:d={secs}",
+            "-f", "lavfi", "-i", f"anoisesrc=a=0.01:c=pink:d={secs}:r=44100:s=1",
+            "-filter_complex", "amix=inputs=2:normalize=0", "-ac", "1", str(path),
+        ]
+    )  # fmt: skip
+    return [i * p for i in range(int(secs / p))]
+
+
+@needs_ffmpeg
+class TestBeats:
+    def test_click_track_tempo_beats_downbeats(self, tmp_path):
+        from openjarvis.tools.video import beats
+
+        wav = tmp_path / "click.wav"
+        truth = _click_track(wav)
+        rep = beats.detect(str(wav))
+        assert abs(rep["tempo_bpm"] - 120.0) < 1.0
+        assert rep["confidence"] >= 0.3
+        errs = [min(abs(b - t) for t in truth) for b in rep["beats"][1:-1]]
+        assert max(errs) < 0.010
+        assert all(
+            min(abs(d - 2.0 * k) for k in range(6)) < 0.02 for d in rep["downbeats"]
+        )
+
+    def test_detect_beats_tool(self, tmp_path):
+        from openjarvis.tools.video_edit import VideoDetectBeatsTool
+
+        wav = tmp_path / "click.wav"
+        _click_track(wav)
+        out = tmp_path / "beats.json"
+        res = VideoDetectBeatsTool(allowed_dirs=[]).execute(
+            path=str(wav), out_path=str(out)
+        )
+        assert res.success, res.content
+        assert "BPM" in res.content and out.exists()
+
+
+class TestPacksAndSnapping:
+    def test_identity_grade_is_identity_lut(self, tmp_path):
+        from openjarvis.tools.video import packs
+
+        cube = packs.write_cube({}, str(tmp_path / "id.cube"), "id", size=5)
+        rows = [list(map(float, ln.split())) for ln in open(cube) if ln[:1].isdigit()]
+        for i, row in enumerate(rows):
+            want = ((i % 5) / 4.0, (i // 5 % 5) / 4.0, (i // 25) / 4.0)
+            assert max(abs(a - b) for a, b in zip(row, want)) < 1e-9
+
+    def test_grade_order_matrix_then_saturation_then_curves(self):
+        from openjarvis.tools.video import packs
+
+        grey = packs.apply_grade((0.5, 0.5, 0.5), {"sat": 0.0})
+        assert max(grey) - min(grey) < 1e-9  # saturation 0 keeps grey grey
+        lifted = packs.apply_grade((0.0, 0.0, 0.0), {"all": [0.1, 1.0]})
+        assert all(abs(v - 0.1) < 1e-9 for v in lifted)
+
+    def test_builtin_grades_always_searchable(self):
+        from openjarvis.tools.video import packs
+
+        ids = [r["id"] for r in packs.search("grade", "warm", limit=20)]
+        assert "grade:warm-vlog" in ids
+
+    def test_jump_cut_slides_onto_beat_inside_its_pause(self):
+        from openjarvis.tools.video import viral
+
+        cuts = [
+            {
+                "start": "1.100",
+                "end": "1.600",
+                "_min_start": "1.030",
+                "label": "jump cut: 0.6s pause after 'x'",
+            }
+        ]
+        landed = viral.snap_cuts(cuts, [Fraction(1), Fraction(3, 2)], [])
+        assert cuts[0]["start"] == viral._ts(Fraction(3, 2)) or landed == []
+        # the beat at 1.5 s leaves under 0.08 s of pause: not taken; 1.0 s is
+        # before the word ends: not taken either. Nothing may clip a word.
+        assert landed == []
+        cuts[0]["start"], cuts[0]["_min_start"] = "1.100", "1.030"
+        landed = viral.snap_cuts(cuts, [Fraction(6, 5)], [])
+        assert landed == [Fraction(6, 5)]
+        assert core.parse_time(cuts[0]["start"]) == Fraction(6, 5)
+
+    @pytest.mark.parametrize(
+        "name",
+        ["video_detect_beats", "video_montage_plan", "video_asset_packs"],
+    )
+    def test_new_tool_specs(self, name):
+        from openjarvis.tools import video_edit
+
+        cls = {
+            "video_detect_beats": video_edit.VideoDetectBeatsTool,
+            "video_montage_plan": video_edit.VideoMontagePlanTool,
+            "video_asset_packs": video_edit.VideoAssetPacksTool,
+        }[name]
+        tool = cls(allowed_dirs=[])
+        assert tool.spec.name == name == tool.tool_id
+        assert tool.spec.category == "media"
+
+
+@needs_ffmpeg
+class TestMontageEndToEnd:
+    def test_cuts_on_the_beat_and_negative_controls(self, tmp_path):
+        from openjarvis.tools.video_edit import VideoMontagePlanTool
+
+        clips = []
+        for i in range(4):
+            p = tmp_path / f"clip{i}.mp4"
+            core.run(
+                [
+                    "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    f"testsrc2=s=320x180:r=30:d=4,hue=h={i * 90}",
+                    "-f", "lavfi", "-i", f"sine=f={300 + 100 * i}:d=4", "-shortest",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(p),
+                ]
+            )  # fmt: skip
+            clips.append(str(p))
+        music = tmp_path / "click.wav"
+        _click_track(music, secs=8.0)
+        edl = tmp_path / "m.edl.json"
+        planned = VideoMontagePlanTool(allowed_dirs=[]).execute(
+            clip_paths=clips,
+            music_path=str(music),
+            bound_out=str(tmp_path / "bound.mp4"),
+            edl_out=str(edl),
+            style="motivation",
+            format="long",
+        )
+        assert planned.success, planned.content
+        plan_path = tmp_path / "m.plan.json"
+        res = VideoPlanTool(allowed_dirs=[]).execute(
+            edl_path=str(edl), plan_out=str(plan_path), preset="draft"
+        )
+        assert res.success, res.content
+        out = tmp_path / "m.mp4"
+        rendered = VideoRenderTool(allowed_dirs=[]).execute(
+            plan_path=str(plan_path), output_path=str(out)
+        )
+        assert rendered.success, rendered.content
+        verified = VideoVerifyTool(allowed_dirs=[]).execute(
+            plan_path=str(plan_path), output_path=str(out)
+        )
+        assert verified.success, verified.content
+        statuses = {
+            r["check"]: r["status"] for r in verified.metadata["report"]["checks"]
+        }
+        assert statuses["BEAT_SYNC"] == "PASS"
+        assert statuses["CUT_FRAMES"] == "PASS"
+        assert statuses["FRAME_COUNT"] == "PASS"
+
+        plan = json.loads(plan_path.read_text())
+        for field, change in (("beats", 2 / 30.0), ("music_start", 2 / 30.0)):
+            bad = copy.deepcopy(plan)
+            if field == "beats":
+                bad["beat_sync"]["beats"] = [
+                    b + change for b in bad["beat_sync"]["beats"]
+                ]
+            else:
+                bad["beat_sync"]["music_start"] = change
+            bad_path = tmp_path / f"bad_{field}.json"
+            bad_path.write_text(json.dumps(bad))
+            res = VideoVerifyTool(allowed_dirs=[]).execute(
+                plan_path=str(bad_path), output_path=str(out)
+            )
+            rows = {r["check"]: r["status"] for r in res.metadata["report"]["checks"]}
+            assert rows["BEAT_SYNC"] == "FAIL", field

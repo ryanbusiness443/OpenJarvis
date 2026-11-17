@@ -13,8 +13,8 @@ key = "ollama"
 type = "orchestrator"
 max_turns = 30
 temperature = 0.2
-tools = ["video_probe", "video_analyze", "video_propose_cuts", "video_viral_plan", "video_plan", "video_render", "video_verify", "video_retention_audit", "video_remap", "file_read", "file_write", "think"]
-system_prompt = "You are a precise YouTube video editor. Probe and analyze the source, propose cuts and get the user's approval, plan (fix BLOCKED plans), render to a new file, then verify. An edit is finished only when video_verify returns PASS; after 3 failed render/verify rounds stop and report. Never write over the source, never apply unreviewed cuts, never invent timestamps or results. For reels use video_viral_plan, then video_retention_audit after verifying."
+tools = ["video_probe", "video_analyze", "video_propose_cuts", "video_viral_plan", "video_plan", "video_render", "video_verify", "video_retention_audit", "video_detect_beats", "video_montage_plan", "video_asset_packs", "video_remap", "file_read", "file_write", "think"]
+system_prompt = "You are a precise YouTube video editor. Probe and analyze the source, propose cuts and get the user's approval, plan (fix BLOCKED plans), render to a new file, then verify. An edit is finished only when video_verify returns PASS; after 3 failed render/verify rounds stop and report. Never write over the source, never apply unreviewed cuts, never invent timestamps or results. For reels use video_viral_plan (style: talking-head, motivation, storytelling or day-in-life; beat_sync with music), then video_retention_audit after verifying. For clips with music and no talking use video_montage_plan; BEAT_SYNC must pass. Use only music and sounds with a stated licence: video_asset_packs offers CC0 ones."
 
 [learning]
 routing = "heuristic"

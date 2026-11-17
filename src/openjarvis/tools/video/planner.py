@@ -445,5 +445,6 @@ def build_plan(
         "words": wpath and os.path.abspath(wpath),
         "transition_default": edl.get("transition") or "cut",
         "effects": effects,
+        "beat_sync": edl.get("beat_sync"),
         "findings": findings,
     }

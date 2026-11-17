@@ -1,6 +1,6 @@
 """Video editing tools — frame-accurate cutting for YouTube, with verification.
 
-Seven tools drive the ``openjarvis.tools.video`` engine (ffmpeg via
+These tools drive the ``openjarvis.tools.video`` engine (ffmpeg via
 subprocess, exact ``Fraction`` time arithmetic):
 
 - ``video_probe``         stream facts and precision warnings (VFR, interlace,
@@ -14,6 +14,9 @@ subprocess, exact ``Fraction`` time arithmetic):
 - ``video_remap``         chapters / captions / timestamps through the edit
 - ``video_viral_plan``    transcript -> short-form retention EDL + editor's notes
 - ``video_retention_audit`` plan -> retention score 0-100 with fixes
+- ``video_detect_beats``  music -> tempo, beats, downbeats, rises and drops
+- ``video_montage_plan``  clips + music -> joined source + EDL cut on the beat
+- ``video_asset_packs``   CC0 music, sounds and grades (OpenFilm library, built-in)
 
 Every path is checked against ``[security] allowed_dirs`` and the
 sensitive-file policy. Tools never modify the source file and refuse to
@@ -45,7 +48,8 @@ _EFFECTS_DOC = (
     "{type: blur, start, end, rect:[x,y,w,h]}. Whole video: {type: color, "
     "brightness, contrast, saturation}, {type: lut, file}, {type: captions, "
     "source, style: youtube|shorts}, {type: music, file, volume_db, duck}, "
-    "{type: fade_in, duration}, {type: fade_out, duration}. Only add effects the "
+    "{type: fade_in, duration}, {type: fade_out, duration}, {type: look, grain, "
+    "vignette, letterbox}, {type: sfx, sound|file, at}. Only add effects the "
     "user asked for."
 )
 
@@ -716,7 +720,9 @@ class VideoViralPlanTool(_VideoTool):
                 "every pause, alternating zoom framing, punch-ins on key words, CTA "
                 "framing, karaoke captions, sound effects, progress bar and a loop "
                 "ending. Writes an EDL for video_plan and returns the editor's notes. "
-                "Intensity: clean, punchy (default) or insane (hype only)."
+                "Intensity: clean, punchy (default) or insane (hype only). Style "
+                "(genre): talking-head, motivation, storytelling, day-in-life. "
+                "beat_sync lands jump cuts and hits on the music's beats."
             ),
             parameters={
                 "type": "object",
@@ -752,6 +758,27 @@ class VideoViralPlanTool(_VideoTool):
                         "items": {"type": "string"},
                         "description": "Extra words to punch in on.",
                     },
+                    "style": {
+                        "type": "string",
+                        "enum": [
+                            "talking-head",
+                            "motivation",
+                            "storytelling",
+                            "day-in-life",
+                        ],
+                    },
+                    "beat_sync": {
+                        "type": "boolean",
+                        "description": "Detect the music's beats; cut and hit on them.",
+                    },
+                    "beats_path": {
+                        "type": "string",
+                        "description": "Beats JSON from video_detect_beats (optional).",
+                    },
+                    "pack_path": {
+                        "type": "string",
+                        "description": "pack.json from video_asset_packs (optional).",
+                    },
                 },
                 "required": ["path", "words_path", "edl_out"],
             },
@@ -769,14 +796,37 @@ class VideoViralPlanTool(_VideoTool):
         music = None
         if params.get("music_path"):
             music = str(self._path(params["music_path"], "music_path"))
+        style = params.get("style", "talking-head")
+        if style not in viral.STYLES:
+            return self._fail(f"Unknown style: {style!r}")
+        pack = None
+        if params.get("pack_path"):
+            from openjarvis.tools.video import packs
+
+            pack = packs.load_pack(str(self._path(params["pack_path"], "pack_path")))
+            if not music and pack.get("music"):
+                music = pack["music"]["file"]
+        beats = None
+        if params.get("beats_path") or params.get("beat_sync"):
+            beats_path = None
+            if params.get("beats_path"):
+                beats_path = str(self._path(params["beats_path"], "beats_path"))
+            elif not music:
+                return self._fail("beat_sync needs music_path (or a pack with music).")
+            duration = core.to_fraction(core.probe(str(path))["duration"])
+            beats, _ = viral.load_beats(beats_path, music, until=duration)
         edl, notes = viral.build_edl(
             str(path),
             str(words_path),
-            params.get("intensity", "punchy"),
+            params.get("intensity") or viral.STYLES[style]["intensity"],
             params.get("format", "short"),
             music,
             params.get("hook"),
             params.get("emphasis") or (),
+            style=style,
+            beats=beats,
+            pack=pack,
+            pack_dir=str(edl_out.parent / f"pack-{style}"),
         )
         core.write_json(edl, str(edl_out))
         text = f"wrote {edl_out} ({len(edl['segments'])} cuts)\n" + "\n".join(
@@ -835,8 +885,277 @@ class VideoRetentionAuditTool(_VideoTool):
         return self._ok("\n".join(lines), report=rep)
 
 
+@ToolRegistry.register("video_detect_beats")
+class VideoDetectBeatsTool(_VideoTool):
+    """Find the tempo, beats and downbeats of a music track."""
+
+    tool_id = "video_detect_beats"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="video_detect_beats",
+            description=(
+                "Detect a music track's tempo (BPM), beats, downbeats and where it "
+                "rises or drops, so cuts and hits can land on the beat. Returns a "
+                "confidence; below 0.3 the beat is weak and should be checked by "
+                "ear. Pass bpm when the tempo is known."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Music file."},
+                    "bpm": {"type": "number", "description": "Known tempo."},
+                    "start": {"type": "number", "description": "Seconds in."},
+                    "duration": {"type": "number", "description": "Seconds."},
+                    "out_path": {
+                        "type": "string",
+                        "description": "Write the beats JSON here (optional).",
+                    },
+                },
+                "required": ["path"],
+            },
+            category="media",
+            timeout_seconds=300.0,
+            required_capabilities=["file:read", "file:write"],
+        )
+
+    def _run(self, **params: Any) -> ToolResult:
+        from openjarvis.tools.video import beats, core
+
+        path = self._path(params.get("path"), "path")
+        rep = beats.detect(
+            str(path),
+            float(params.get("start") or 0.0),
+            params.get("duration"),
+            params.get("bpm"),
+        )
+        if params.get("out_path"):
+            out = self._path(params["out_path"], "out_path", must_exist=False)
+            core.write_json(rep, str(out))
+        changes = [
+            f"{s['change']} at {s['start']:.2f}s"
+            for s in rep["sections"]
+            if s["change"]
+        ]
+        text = (
+            f"{rep['tempo_bpm']} BPM (confidence {rep['confidence']}), "
+            f"{rep['beat_count']} beats, {len(rep['downbeats'])} bars"
+        )
+        if changes:
+            text += "; " + ", ".join(changes)
+        if rep.get("warning"):
+            text += "\nwarning: " + rep["warning"]
+        return self._ok(text, report=rep)
+
+
+@ToolRegistry.register("video_montage_plan")
+class VideoMontagePlanTool(_VideoTool):
+    """Cut a set of clips to a music track with every cut on a beat."""
+
+    tool_id = "video_montage_plan"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="video_montage_plan",
+            description=(
+                "Join clips (one size and frame rate, fill-cropped) into one source "
+                "and write an EDL that cuts every shot on the music's beat, in a "
+                "genre style: day-in-life (time cards, shutter clicks), motivation "
+                "(faster in rises, flashes and quotes on downbeats) or storytelling "
+                "(4-beat shots, push-ins). Then video_plan, video_render, "
+                "video_verify (its BEAT_SYNC check proves the cuts)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "clip_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Clips or folders, in story order.",
+                    },
+                    "music_path": {"type": "string", "description": "Music."},
+                    "bound_out": {
+                        "type": "string",
+                        "description": "Where to write the joined source.",
+                    },
+                    "edl_out": {"type": "string", "description": "EDL output."},
+                    "style": {
+                        "type": "string",
+                        "enum": ["day-in-life", "motivation", "storytelling"],
+                    },
+                    "format": {"type": "string", "enum": ["short", "long"]},
+                    "length": {"type": "number", "description": "Target seconds."},
+                    "labels": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Day-in-life card per clip.",
+                    },
+                    "texts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Quote lines placed on downbeats.",
+                    },
+                    "bpm": {"type": "number", "description": "Known tempo."},
+                    "pack_path": {"type": "string", "description": "pack.json."},
+                    "mute_clips": {"type": "boolean"},
+                },
+                "required": ["clip_paths", "music_path", "bound_out", "edl_out"],
+            },
+            category="media",
+            timeout_seconds=1800.0,
+            required_capabilities=["file:read", "file:write"],
+        )
+
+    def _run(self, **params: Any) -> ToolResult:
+        from openjarvis.tools.video import core, montage
+
+        clips = [
+            str(self._path(c, "clip_paths")) for c in params.get("clip_paths") or []
+        ]
+        music = str(self._path(params.get("music_path"), "music_path"))
+        bound = self._path(params.get("bound_out"), "bound_out", must_exist=False)
+        edl_out = self._path(params.get("edl_out"), "edl_out", must_exist=False)
+        style = params.get("style", "day-in-life")
+        if style not in montage.STYLES:
+            return self._fail(f"Unknown style: {style!r}")
+        pack = None
+        if params.get("pack_path"):
+            pack = str(self._path(params["pack_path"], "pack_path"))
+        edl, notes = montage.run(
+            montage.find_clips(clips),
+            music,
+            style,
+            params.get("format", "short"),
+            str(bound),
+            params.get("length"),
+            params.get("labels"),
+            params.get("texts") or (),
+            None,
+            params.get("bpm"),
+            pack,
+            None,
+            None if params.get("mute_clips") else -30.0,
+        )
+        core.write_json(edl, str(edl_out))
+        text = (
+            f"wrote {bound} and {edl_out} ({len(edl['segments'])} shots)\n"
+            + "\n".join("- " + n for n in notes)
+        )
+        return self._ok(
+            text + "\nNext: video_plan, video_render, video_verify (BEAT_SYNC).",
+            edl_path=str(edl_out),
+            bound_path=str(bound),
+            notes=notes,
+        )
+
+
+@ToolRegistry.register("video_asset_packs")
+class VideoAssetPacksTool(_VideoTool):
+    """Search and take licence-clean music, sounds and colour grades."""
+
+    tool_id = "video_asset_packs"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="video_asset_packs",
+            description=(
+                "Music, sound effects and colour grades with a stated licence: "
+                "built-in grades, and OpenFilm's CC0 library (~1,200 tracks with "
+                "tempo and energy, ~5,400 sounds, 66 grades; needs `npm i -g "
+                "openfilm`). action=search (kind music|sfx|grade, prompt, bpm), "
+                "take (item_id into dir; grades become .cube LUTs), or pack (a "
+                "genre's grade + music + sounds as pack.json)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["search", "take", "pack"],
+                    },
+                    "kind": {"type": "string", "enum": ["music", "sfx", "grade"]},
+                    "prompt": {"type": "string"},
+                    "bpm": {"type": "number"},
+                    "min_sec": {"type": "number"},
+                    "limit": {"type": "integer"},
+                    "item_id": {"type": "string"},
+                    "style": {
+                        "type": "string",
+                        "enum": [
+                            "talking-head",
+                            "motivation",
+                            "storytelling",
+                            "day-in-life",
+                        ],
+                    },
+                    "dir": {"type": "string", "description": "Pack folder."},
+                },
+                "required": ["action"],
+            },
+            category="media",
+            timeout_seconds=600.0,
+            required_capabilities=["file:read", "file:write", "network:fetch"],
+        )
+
+    def _run(self, **params: Any) -> ToolResult:
+        from openjarvis.tools.video import packs
+
+        action = params.get("action")
+        if action == "search":
+            kind = params.get("kind")
+            if kind not in ("music", "sfx", "grade"):
+                return self._fail("search needs kind: music, sfx or grade.")
+            rows = packs.search(
+                kind,
+                params.get("prompt", ""),
+                params.get("bpm"),
+                None,
+                params.get("min_sec"),
+                int(params.get("limit") or 8),
+            )
+            if not rows:
+                return self._ok("nothing matched", results=[])
+            lines = [
+                f"{r['id']}  {r['name']}"
+                + (f"  {r.get('bpm')} BPM {r.get('sec')}s" if kind == "music" else "")
+                + f"  [{r['licence']}]"
+                for r in rows
+            ]
+            return self._ok("\n".join(lines), results=rows)
+        dest = self._path(params.get("dir") or "pack", "dir", must_exist=False)
+        if action == "take":
+            if not params.get("item_id"):
+                return self._fail("take needs item_id (from search).")
+            item = packs.take(params["item_id"], str(dest))
+            return self._ok(f"{item['file']} ({item['licence']})", item=item)
+        if action == "pack":
+            style = params.get("style")
+            if style not in packs.STYLES:
+                return self._fail("pack needs a style.")
+            pack = packs.build_pack(style, str(dest))
+            names = ", ".join(
+                f"{k}: {v.get('name', os.path.basename(v['file']))}"
+                for k, v in sorted(pack.get("sfx", {}).items())
+            )
+            music = pack.get("music", {}).get("name", "none")
+            return self._ok(
+                f"pack {style} in {dest}: grade {pack['grade']['file']}, "
+                f"music {music}, sounds {names or 'built-in'}"
+                + ("".join("\n" + n for n in pack.get("notes", []))),
+                pack=pack,
+                pack_path=str(dest / "pack.json"),
+            )
+        return self._fail(f"Unknown action: {action!r}")
+
+
 __all__ = [
     "VideoAnalyzeTool",
+    "VideoAssetPacksTool",
+    "VideoDetectBeatsTool",
+    "VideoMontagePlanTool",
     "VideoPlanTool",
     "VideoProbeTool",
     "VideoProposeCutsTool",

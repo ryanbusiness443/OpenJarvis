@@ -76,6 +76,7 @@ LOCAL_EFFECTS = {"zoom", "text", "blur", "shake", "flash", "glitch", "bw"}
 GLOBAL_EFFECTS = {
     "color",
     "lut",
+    "look",
     "captions",
     "music",
     "fade_in",
@@ -248,6 +249,20 @@ def has_transitions(plan):
     return any(s.get("trans_in_frames") for s in plan["segments"])
 
 
+def is_reordered(plan):
+    """Pieces out of source order, or reusing frames (a montage revisiting a clip)."""
+    segs = plan["segments"]
+    return any(
+        b["src_start_frame"] < a["src_end_frame"] for a, b in zip(segs, segs[1:])
+    )
+
+
+def needs_piece_inputs(plan):
+    """A single select pass keeps source order; transitions, reordered or reused
+    pieces each need their own exactly-seeked input."""
+    return has_transitions(plan) or is_reordered(plan)
+
+
 # --------------------------------------------------------------------------
 # Effects: validation + source -> output timing
 # --------------------------------------------------------------------------
@@ -296,9 +311,14 @@ def plan_effects(edl, segments, total_frames, fps, base_dir, findings):
         e = {"type": kind, "index": i}
         if kind == "sfx":
             sound = eff.get("sound")
-            if sound not in SFX_SOUNDS:
+            sfx_file = None
+            if eff.get("file"):
+                # a sound from a pack (OpenFilm library, your own licensed files)
+                sfx_file = _resolve(eff["file"], base_dir)
+                sound = "file:" + os.path.basename(sfx_file)
+            elif sound not in SFX_SOUNDS:
                 raise core.ToolError(
-                    "sfx %d: sound must be one of %s"
+                    "sfx %d: sound must be one of %s, or give a file"
                     % (i, ", ".join(sorted(SFX_SOUNDS)))
                 )
             at = core.parse_time(eff.get("at", eff.get("start", 0)), fps)
@@ -339,9 +359,13 @@ def plan_effects(edl, segments, total_frames, fps, base_dir, findings):
                 {
                     "sound": sound,
                     "out_frame": frame,
-                    "gain_db": float(eff.get("gain_db", SFX_SOUNDS[sound][2])),
+                    "gain_db": float(
+                        eff.get("gain_db", -8.0 if sfx_file else SFX_SOUNDS[sound][2])
+                    ),
                 }
             )
+            if sfx_file:
+                e["file"] = sfx_file
             planned.append(e)
             continue
         if kind in LOCAL_EFFECTS:
@@ -462,6 +486,19 @@ def plan_effects(edl, segments, total_frames, fps, base_dir, findings):
                     e[k] = v
             elif kind == "lut":
                 e["file"] = _resolve(eff.get("file"), base_dir)
+            elif kind == "look":
+                e["grain"] = int(eff.get("grain", 0))
+                if not 0 <= e["grain"] <= 30:
+                    raise core.ToolError("look grain must be 0..30")
+                e["vignette"] = float(eff.get("vignette", 0))
+                if not 0 <= e["vignette"] <= 1:
+                    raise core.ToolError("look vignette must be 0..1")
+                lb = eff.get("letterbox")
+                e["letterbox"] = float(lb) if lb else None
+                if e["letterbox"] is not None and not 1.0 <= e["letterbox"] <= 3.0:
+                    raise core.ToolError(
+                        "look letterbox is an aspect ratio, 1.0..3.0 (2.39 scope)"
+                    )
             elif kind == "captions":
                 e["source"] = _resolve(eff.get("source"), base_dir)
                 e["style"] = eff.get("style", "youtube")
@@ -570,6 +607,25 @@ def color_filters(effects):
             )
         elif e["type"] == "lut":
             out.append("lut3d=file='%s'" % _esc(e["file"]))
+    for e in effects:
+        if e["type"] == "look":
+            out.extend(look_filters(e))
+    return out
+
+
+def look_filters(e):
+    """Vignette, grain and letterbox bars. All deterministic per frame, so the
+    verifier's rebuild matches: the vignette is evaluated once, the grain is a
+    fixed pattern (no temporal flag), the bars are plain boxes."""
+    out = []
+    if e.get("vignette"):
+        out.append("vignette=angle=%.4f" % (0.15 + 0.6 * e["vignette"]))
+    if e.get("grain"):
+        out.append("noise=alls=%d:allf=u+p" % e["grain"])
+    if e.get("letterbox"):
+        bar = "max(0\\,(ih-iw/%.4f)/2)" % e["letterbox"]
+        out.append("drawbox=x=0:y=0:w=iw:h=%s:color=black:t=fill" % bar)
+        out.append("drawbox=x=0:y=ih-%s:w=iw:h=%s:color=black:t=fill" % (bar, bar))
     return out
 
 
@@ -929,6 +985,40 @@ def music_effect(effects):
 
 def sfx_effects(effects):
     return [e for e in effects if e["type"] == "sfx"]
+
+
+def sfx_wav(e, tmpdir, cache=None):
+    """The 48 kHz mono WAV for one planned sound effect: synthesized, or decoded
+    from its file. Cached per sound so a sound used ten times is made once."""
+    key = e.get("file") or e["sound"]
+    if cache is not None and key in cache:
+        return cache[key]
+    path = os.path.join(tmpdir, "sfx_%d.wav" % (len(cache) if cache is not None else 0))
+    if e.get("file"):
+        ffmpeg, _ = core.require_ffmpeg()
+        core.run(
+            [
+                ffmpeg,
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                e["file"],
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "48000",
+                "-c:a",
+                "pcm_s16le",
+                path,
+            ]
+        )
+    else:
+        synth_sfx(e["sound"], path)
+    if cache is not None:
+        cache[key] = path
+    return path
 
 
 def synth_sfx(sound, path):

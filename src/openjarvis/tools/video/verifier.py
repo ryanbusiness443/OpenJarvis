@@ -385,12 +385,11 @@ def verify_sfx(plan, out_path, tmpdir, max_sfx=12):
         effects = [effects[int(i * step)] for i in range(max_sfx)]
     ffmpeg, _ = core.require_ffmpeg()
     lag_max = AUDIO_RATE * SFX_SEARCH_MS // 1000
-    rows, refs = [], {}
+    rows, refs, wavs = [], {}, {}
     for e in effects:
-        if e["sound"] not in refs:
-            wav = fx.synth_sfx(
-                e["sound"], os.path.join(tmpdir, "ref_%s.wav" % e["sound"])
-            )
+        key = e.get("file") or e["sound"]
+        if key not in refs:
+            wav = fx.sfx_wav(e, tmpdir, wavs)
             raw = core.run(
                 [
                     ffmpeg,
@@ -409,11 +408,16 @@ def verify_sfx(plan, out_path, tmpdir, max_sfx=12):
             ).stdout
             ref = array.array("h")
             ref.frombytes(raw[: len(raw) // 2 * 2])
-            refs[e["sound"]] = list(ref)[
-                : AUDIO_RATE // 4
-            ]  # first 250 ms carries the attack
-        ref = refs[e["sound"]]
-        t = core.frame_time(e["out_frame"], fps)
+            # library sounds can open with silence: start the reference at the
+            # attack (first sample within 30 dB of the peak), remember the offset
+            peak = max((abs(x) for x in ref), default=0)
+            lead = next((i for i, x in enumerate(ref) if abs(x) >= peak * 0.03), 0)
+            refs[key] = (
+                list(ref)[lead : lead + AUDIO_RATE // 4],
+                lead,
+            )  # 250 ms of attack
+        ref, lead = refs[key]
+        t = core.frame_time(e["out_frame"], fps) + Fraction(lead, AUDIO_RATE)
         pad = Fraction(lag_max, AUDIO_RATE)
         start = max(Fraction(0), t - pad)
         probe = _pcm(out_path, start, Fraction(len(ref), AUDIO_RATE) + 2 * pad)
@@ -454,6 +458,64 @@ def verify_sfx(plan, out_path, tmpdir, max_sfx=12):
             }
         )
     return rows
+
+
+def verify_beats(plan, out_path):
+    """BEAT_SYNC: (1) every cut the plan put on a beat sits within half a frame of
+    it; (2) the music in the render sits where the plan put it, found by
+    cross-correlating onset envelopes of the output and the music file."""
+    from openjarvis.tools.video import beats as bd
+
+    bs = plan.get("beat_sync") or {}
+    fps = core.to_fraction(plan["fps"])
+    half = Fraction(1, 2) / fps + Fraction(1, 1000)
+    beats = [Fraction(str(b)) for b in bs.get("beats", [])]
+    on = total = 0
+    worst = Fraction(0)
+    starts = [core.frame_time(s["out_start_frame"], fps) for s in plan["segments"][1:]]
+    if bs.get("all_cuts_on_beat"):
+        targets = starts
+    else:  # the cuts the planner slid onto a beat: find each in the plan
+        targets = []
+        for c in bs.get("cut_times", []):
+            c = Fraction(str(c))
+            near = min(starts, key=lambda t: abs(t - c)) if starts else None
+            targets.append(
+                near if near is not None and abs(near - c) <= half else c + 99
+            )
+    for t in targets:
+        total += 1
+        d = min(abs(b - t) for b in beats) if beats else Fraction(99)
+        worst = max(worst, d)
+        on += d <= half
+    res = {
+        "cuts_on_beat": on,
+        "cuts_planned_on_beat": total,
+        "worst_cut_offset_ms": round(float(worst) * 1000, 2),
+    }
+    music = bs.get("music")
+    dur = float(core.frame_time(plan["total_frames"], fps))
+    if music and os.path.isfile(music):
+        span = min(dur, 60.0)
+        a = bd.onset_envelope(bd.band_energies(out_path, 0, span))
+        b = bd.onset_envelope(
+            bd.band_energies(music, float(bs.get("music_start", 0)), span)
+        )
+        n = min(len(a), len(b))
+        a, b = a[:n], b[:n]
+        ea = sum(x * x for x in a) or 1
+        eb = sum(x * x for x in b) or 1
+        scores = {}
+        for lag in range(-30, 31):
+            dot = sum(a[i + lag] * b[i] for i in range(max(0, -lag), min(n, n - lag)))
+            scores[lag] = dot / (ea * eb) ** 0.5
+        lag = max(scores, key=scores.get)
+        y0, y1, y2 = scores.get(lag - 1, 0), scores[lag], scores.get(lag + 1, 0)
+        den = y0 - 2 * y1 + y2
+        frac = 0.5 * (y0 - y2) / den if den else 0.0
+        res["music_lag_ms"] = round((lag + frac) * bd.HOP_S * 1000, 2)
+        res["music_correlation"] = round(y1, 3)
+    return res
 
 
 def verify_cuts(ctx, out_path, max_cuts=50):
@@ -873,6 +935,34 @@ def verify(plan, out_path, max_cuts=50, check_loudness=True):
                 sum(1 for r in sfx_rows if r["status"] == "AMBIGUOUS"),
                 len(bad),
             ),
+        )
+    beat_res = None
+    if plan.get("beat_sync") and plan["has_audio"] and a:
+        beat_res = verify_beats(plan, out_path)
+        tol = max(10.0, 500.0 / float(core.to_fraction(plan["fps"])))
+        lag = beat_res.get("music_lag_ms")
+        corr = beat_res.get("music_correlation", 0)
+        cuts_ok = beat_res["cuts_on_beat"] == beat_res["cuts_planned_on_beat"]
+        detail = "%d/%d planned cuts on the beat (worst %.1f ms)" % (
+            beat_res["cuts_on_beat"],
+            beat_res["cuts_planned_on_beat"],
+            beat_res["worst_cut_offset_ms"],
+        )
+        status = None
+        if lag is not None:
+            detail += "; music at %+.1f ms (limit %.1f, correlation %.2f)" % (
+                lag,
+                tol,
+                corr,
+            )
+            if corr < 0.3 and cuts_ok:
+                status = "AMBIGUOUS"
+        _check(
+            rows,
+            "BEAT_SYNC",
+            cuts_ok and (lag is None or corr < 0.3 or abs(lag) <= tol),
+            detail,
+            status=status,
         )
     if plan["has_video"] and v and max_cuts != 0:
         with tempfile.TemporaryDirectory() as tmp:
