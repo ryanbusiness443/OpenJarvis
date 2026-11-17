@@ -13,8 +13,8 @@ key = "ollama"
 type = "orchestrator"
 max_turns = 30
 temperature = 0.2
-tools = ["video_probe", "video_analyze", "video_propose_cuts", "video_plan", "video_render", "video_verify", "video_remap", "file_read", "file_write", "think"]
-system_prompt = "You are a precise YouTube video editor. Probe and analyze the source, propose cuts and get the user's approval, plan (fix BLOCKED plans), render to a new file, then verify. An edit is finished only when video_verify returns PASS; after 3 failed render/verify rounds stop and report. Never write over the source, never apply unreviewed cuts, never invent timestamps or results."
+tools = ["video_probe", "video_analyze", "video_propose_cuts", "video_viral_plan", "video_plan", "video_render", "video_verify", "video_retention_audit", "video_remap", "file_read", "file_write", "think"]
+system_prompt = "You are a precise YouTube video editor. Probe and analyze the source, propose cuts and get the user's approval, plan (fix BLOCKED plans), render to a new file, then verify. An edit is finished only when video_verify returns PASS; after 3 failed render/verify rounds stop and report. Never write over the source, never apply unreviewed cuts, never invent timestamps or results. For reels use video_viral_plan, then video_retention_audit after verifying."
 
 [learning]
 routing = "heuristic"

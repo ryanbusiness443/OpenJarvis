@@ -12,6 +12,8 @@ subprocess, exact ``Fraction`` time arithmetic):
 - ``video_render``        plan -> MP4 in one decode pass (never stream copy)
 - ``video_verify``        plan + render -> PASS/FAIL with per-cut frame matching
 - ``video_remap``         chapters / captions / timestamps through the edit
+- ``video_viral_plan``    transcript -> short-form retention EDL + editor's notes
+- ``video_retention_audit`` plan -> retention score 0-100 with fixes
 
 Every path is checked against ``[security] allowed_dirs`` and the
 sensitive-file policy. Tools never modify the source file and refuse to
@@ -698,6 +700,141 @@ class VideoRemapTool(_VideoTool):
         return self._fail(f"Unknown kind: {kind!r}")
 
 
+@ToolRegistry.register("video_viral_plan")
+class VideoViralPlanTool(_VideoTool):
+    """Plan a short-form retention edit (Shorts / Reels / TikTok) from a transcript."""
+
+    tool_id = "video_viral_plan"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="video_viral_plan",
+            description=(
+                "Plan a retention edit for Shorts, Reels or TikTok from word "
+                "timestamps: hook title card + flash + boom on frame 1, jump cuts on "
+                "every pause, alternating zoom framing, punch-ins on key words, CTA "
+                "framing, karaoke captions, sound effects, progress bar and a loop "
+                "ending. Writes an EDL for video_plan and returns the editor's notes. "
+                "Intensity: clean, punchy (default) or insane (hype only)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Source video."},
+                    "words_path": {
+                        "type": "string",
+                        "description": "Word-timestamp JSON (required).",
+                    },
+                    "edl_out": {
+                        "type": "string",
+                        "description": "Where to write the EDL.",
+                    },
+                    "intensity": {
+                        "type": "string",
+                        "enum": ["clean", "punchy", "insane"],
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["short", "long"],
+                        "description": "short = vertical reel; long = YouTube.",
+                    },
+                    "music_path": {
+                        "type": "string",
+                        "description": "Licensed music bed (optional).",
+                    },
+                    "hook": {
+                        "type": "string",
+                        "description": "Hook title text (default: first sentence).",
+                    },
+                    "emphasis": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Extra words to punch in on.",
+                    },
+                },
+                "required": ["path", "words_path", "edl_out"],
+            },
+            category="media",
+            timeout_seconds=300.0,
+            required_capabilities=["file:read", "file:write"],
+        )
+
+    def _run(self, **params: Any) -> ToolResult:
+        from openjarvis.tools.video import core, viral
+
+        path = self._path(params.get("path"), "path")
+        words_path = self._path(params.get("words_path"), "words_path")
+        edl_out = self._path(params.get("edl_out"), "edl_out", must_exist=False)
+        music = None
+        if params.get("music_path"):
+            music = str(self._path(params["music_path"], "music_path"))
+        edl, notes = viral.build_edl(
+            str(path),
+            str(words_path),
+            params.get("intensity", "punchy"),
+            params.get("format", "short"),
+            music,
+            params.get("hook"),
+            params.get("emphasis") or (),
+        )
+        core.write_json(edl, str(edl_out))
+        text = f"wrote {edl_out} ({len(edl['segments'])} cuts)\n" + "\n".join(
+            "- " + n for n in notes
+        )
+        return self._ok(
+            text + "\nNext: video_plan with this EDL, video_render, video_verify, "
+            "then video_retention_audit.",
+            edl_path=str(edl_out),
+            notes=notes,
+        )
+
+
+@ToolRegistry.register("video_retention_audit")
+class VideoRetentionAuditTool(_VideoTool):
+    """Score a plan for short-form retention with fixes."""
+
+    tool_id = "video_retention_audit"
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="video_retention_audit",
+            description=(
+                "Score an edit plan 0-100 for retention: hook speed, hook visual and "
+                "text, longest still stretch, change rate, captions, length, sound "
+                "density, call to action and loop ending, with the fixes that would "
+                "raise it. Pacing only: the idea and first sentence decide reach."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "plan_path": {"type": "string", "description": "Plan JSON."},
+                    "format": {"type": "string", "enum": ["short", "long"]},
+                },
+                "required": ["plan_path"],
+            },
+            category="media",
+            timeout_seconds=60.0,
+            required_capabilities=["file:read"],
+        )
+
+    def _run(self, **params: Any) -> ToolResult:
+        from openjarvis.tools.video import core, retention
+
+        plan = core.load_json(str(self._path(params.get("plan_path"), "plan_path")))
+        rep = retention.audit(plan, params.get("format", "short"))
+        lines = [
+            f"retention score {rep['score']}/100 ({rep['grade']}), "
+            f"{rep['length_s']}s, longest still {rep['longest_still_s']}s"
+        ]
+        for r in rep["checks"]:
+            lines.append(f"  {r['check']:<11} {r['status']:<7} {r['detail']}")
+        lines += [f"  fix: {f}" for f in rep["fixes"]]
+        lines.append(rep["caveat"])
+        return self._ok("\n".join(lines), report=rep)
+
+
 __all__ = [
     "VideoAnalyzeTool",
     "VideoPlanTool",
@@ -705,5 +842,7 @@ __all__ = [
     "VideoProposeCutsTool",
     "VideoRemapTool",
     "VideoRenderTool",
+    "VideoRetentionAuditTool",
     "VideoVerifyTool",
+    "VideoViralPlanTool",
 ]

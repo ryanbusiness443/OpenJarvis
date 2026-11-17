@@ -77,6 +77,11 @@ class _Ctx:
         cfg = PRESETS.get(plan["output"].get("preset", "youtube"), {})
         self.geo, self.size = fx.geometry_filters(self.info, cfg)
         self.color = fx.color_filters(self.effects)
+        self.bars = [
+            fx.progress_bar_filter(e, self.size)
+            for e in self.effects
+            if e["type"] == "progress_bar"
+        ]
         self.base_vf = ",".join(self.geo + self.color)
         cap = next((e for e in self.effects if e["type"] == "captions"), None)
         # Burned captions are re-rendered onto source frames at the matching
@@ -120,21 +125,46 @@ class _Ctx:
     def mad(self, a, b):
         return core.mad(a, b)
 
-    def src_vf(self, out_frame, captions=True):
-        """Source-frame filter: geometry + colour, plus captions as of out_frame."""
-        vf = self.base_vf
-        if captions and self.cap_filter:
-            vf += ",setpts=%.9f/TB,%s" % (
-                float(core.frame_time(out_frame, self.fps)),
-                self.cap_filter,
+    def fx_chain(self, label_in, out_frame, effects=(), captions=True):
+        """Graph lines taking [label_in] through the renderer's post-assembly chain.
+
+        Order matches render_engine: the frame is first stamped with its output
+        time (shake, flash, captions and the progress bar are driven by it), then
+        colour, the given local effects in render order, captions, progress bar.
+        Returns (lines, label_out).
+        """
+        pre = [
+            "setpts=%.9f/TB" % float(core.frame_time(out_frame, self.fps))
+        ] + self.color
+        lines = ["[%s]%s[c0]" % (label_in, ",".join(pre))]
+        label = "c0"
+        for i, e in enumerate(sorted(effects, key=lambda x: x["index"])):
+            nxt = "c%d" % (i + 1)
+            lines.append(
+                fx.local_effect_graph(e, self.size, label, nxt, self.tmp, enable=False)
             )
-        return vf
+            label = nxt
+        post = ([self.cap_filter] if captions and self.cap_filter else []) + self.bars
+        if post:
+            lines.append("[%s]%s[cp]" % (label, ",".join(post)))
+            label = "cp"
+        return lines, label
+
+    def src_vf(self, out_frame, effects=(), captions=True):
+        """A -vf graph turning a decoded source frame into what output frame
+        out_frame should show (minus transitions)."""
+        lines, label = self.fx_chain("g", out_frame, effects, captions)
+        return "%s[g];%s;[%s]null" % (",".join(self.geo), ";".join(lines), label)
 
 
-def _grab(path, first, count, fps, vf=None, size=None):
+COLOR_EFFECTS = {"bw", "glitch"}  # judged on colour thumbnails, not grey
+
+
+def _grab(path, first, count, fps, vf=None, size=None, rgb=False):
     tw, th = size or (core.THUMB_W, core.THUMB_H)
-    if vf is None:
+    if vf is None and not rgb:
         return core.grab_frames(path, first, count, fps, size=size)
+    vf = vf or "null"
     ffmpeg, _ = core.require_ffmpeg()
     first = max(0, first)
     seek = (Fraction(first) - Fraction(1, 2)) / fps if first else Fraction(0)
@@ -151,13 +181,14 @@ def _grab(path, first, count, fps, vf=None, size=None):
         "-frames:v",
         str(count),
         "-vf",
-        "%s,scale=%d:%d:flags=area,format=gray" % (vf, tw, th),
+        "%s,scale=%d:%d:flags=area,format=%s"
+        % (vf, tw, th, "rgb24" if rgb else "gray"),
         "-f",
         "rawvideo",
         "-",
     ]
     raw = core.run(cmd).stdout
-    n = tw * th
+    n = tw * th * (3 if rgb else 1)
     return [raw[i : i + n] for i in range(0, len(raw) - n + 1, n)]
 
 
@@ -339,6 +370,92 @@ def verify_audio(plan, out_path, max_pieces=12):
     return rows
 
 
+SFX_SEARCH_MS = 50
+SFX_TOLERANCE_MS = 2.0
+
+
+def verify_sfx(plan, out_path, tmpdir, max_sfx=12):
+    """Find each synthesized sound effect in the output by cross-correlation."""
+    import array
+
+    fps = core.to_fraction(plan["fps"])
+    effects = fx.sfx_effects(plan.get("effects") or [])
+    if max_sfx and len(effects) > max_sfx:
+        step = len(effects) / float(max_sfx)
+        effects = [effects[int(i * step)] for i in range(max_sfx)]
+    ffmpeg, _ = core.require_ffmpeg()
+    lag_max = AUDIO_RATE * SFX_SEARCH_MS // 1000
+    rows, refs = [], {}
+    for e in effects:
+        if e["sound"] not in refs:
+            wav = fx.synth_sfx(
+                e["sound"], os.path.join(tmpdir, "ref_%s.wav" % e["sound"])
+            )
+            raw = core.run(
+                [
+                    ffmpeg,
+                    "-v",
+                    "error",
+                    "-i",
+                    wav,
+                    "-ac",
+                    "1",
+                    "-ar",
+                    str(AUDIO_RATE),
+                    "-f",
+                    "s16le",
+                    "-",
+                ]
+            ).stdout
+            ref = array.array("h")
+            ref.frombytes(raw[: len(raw) // 2 * 2])
+            refs[e["sound"]] = list(ref)[
+                : AUDIO_RATE // 4
+            ]  # first 250 ms carries the attack
+        ref = refs[e["sound"]]
+        t = core.frame_time(e["out_frame"], fps)
+        pad = Fraction(lag_max, AUDIO_RATE)
+        start = max(Fraction(0), t - pad)
+        probe = _pcm(out_path, start, Fraction(len(ref), AUDIO_RATE) + 2 * pad)
+        offset0 = int((t - start) * AUDIO_RATE)  # where lag 0 sits inside probe
+        e_ref = sum(x * x for x in ref) or 1
+        best, best_score = None, -2.0
+        for lag in range(-lag_max, lag_max + 1):
+            o = offset0 + lag
+            if o < 0 or o + len(ref) > len(probe):
+                continue
+            seg = probe[o : o + len(ref)]
+            dot = sum(a * b for a, b in zip(ref, seg))
+            score = dot / ((e_ref * (sum(b * b for b in seg) or 1)) ** 0.5)
+            if score > best_score:
+                best, best_score = lag, score
+        if best is None:
+            rows.append(
+                {
+                    "sound": e["sound"],
+                    "out_frame": e["out_frame"],
+                    "status": "AMBIGUOUS",
+                    "detail": "window outside the audio",
+                }
+            )
+            continue
+        lag_ms = best * 1000.0 / AUDIO_RATE
+        if best_score < 0.35:
+            status = "AMBIGUOUS"  # masked by voice or music at this level
+        else:
+            status = "PASS" if abs(lag_ms) <= SFX_TOLERANCE_MS else "FAIL"
+        rows.append(
+            {
+                "sound": e["sound"],
+                "out_frame": e["out_frame"],
+                "status": status,
+                "lag_ms": round(lag_ms, 3),
+                "correlation": round(best_score, 3),
+            }
+        )
+    return rows
+
+
 def verify_cuts(ctx, out_path, max_cuts=50):
     """Match the first and last *clean* frame of every piece against the source."""
     probes = []  # (label, out_frame, src_frame)
@@ -390,32 +507,27 @@ def verify_cuts(ctx, out_path, max_cuts=50):
     return results
 
 
-def _thumb_out(ctx, out_path, o, size=None):
-    t = core.grab_frames(out_path, o, 1, ctx.fps, size=size)
+def _thumb_out(ctx, out_path, o, size=None, rgb=False):
+    if rgb:
+        t = _grab(out_path, o, 1, ctx.fps, None, size, rgb=True)
+    else:
+        t = core.grab_frames(out_path, o, 1, ctx.fps, size=size)
     return t[0] if t else None
 
 
-def _thumb_src(ctx, sf, out_frame, effects=(), captions=True, size=None):
-    """Source frame through the renderer's chain: geometry, colour, the given local
-    effects (in render order), then captions as of out_frame."""
+def _thumb_src(ctx, sf, out_frame, effects=(), captions=True, size=None, rgb=False):
+    """Source frame through the renderer's chain as of output frame out_frame."""
     if isinstance(effects, dict):
         effects = [effects]
-    vf = ctx.base_vf
-    if effects:
-        label, parts = "g0", [vf + "[g0]"]
-        for i, e in enumerate(sorted(effects, key=lambda x: x["index"])):
-            nxt = "g%d" % (i + 1)
-            parts.append(
-                fx.local_effect_graph(e, ctx.size, label, nxt, ctx.tmp, enable=False)
-            )
-            label = nxt
-        vf = ";".join(parts) + ";[%s]null" % label
-    if captions and ctx.cap_filter:
-        vf += ",setpts=%.9f/TB,%s" % (
-            float(core.frame_time(out_frame, ctx.fps)),
-            ctx.cap_filter,
-        )
-    t = _grab(ctx.plan["source"], sf, 1, ctx.fps, vf, size)
+    t = _grab(
+        ctx.plan["source"],
+        sf,
+        1,
+        ctx.fps,
+        ctx.src_vf(out_frame, effects, captions),
+        size,
+        rgb=rgb,
+    )
     return t[0] if t else None
 
 
@@ -450,12 +562,17 @@ def verify_effects(ctx, out_path):
                 )
                 continue
             size = TEXT_THUMB if e["type"] == "text" else None
-            out_t = _thumb_out(ctx, out_path, o, size)
-            plain = _thumb_src(ctx, sf, o, others, size=size)
-            with_fx = _thumb_src(ctx, sf, o, others + [e], size=size)
+            rgb = e["type"] in COLOR_EFFECTS
+            out_t = _thumb_out(ctx, out_path, o, size, rgb=rgb)
+            plain = _thumb_src(ctx, sf, o, others, size=size, rgb=rgb)
+            with_fx = _thumb_src(ctx, sf, o, others + [e], size=size, rgb=rgb)
             d_fx, d_plain = ctx.mad(out_t, with_fx), ctx.mad(out_t, plain)
             near, far = (d_fx, d_plain) if inside else (d_plain, d_fx)
-            if abs(d_fx - d_plain) < 0.5:
+            if abs(d_fx - d_plain) < 0.5 and not inside and d_plain <= MATCH_MAX_MAD:
+                # The effect leaves no trace on this frame (a flash that has fully
+                # decayed), and the output matches the plain frame: correct either way.
+                status = "PASS"
+            elif abs(d_fx - d_plain) < 0.5:
                 status = "AMBIGUOUS"
             else:
                 status = (
@@ -493,33 +610,24 @@ def _expected_transition_frame(ctx, prev, cur, k):
         ",".join(ctx.geo),
     )
     m = cur["out_start_frame"] + k
-    # Same order as the renderer: colour, then any local effect covering frame m
-    # (a zoom over a transition zooms the blend), then captions.
+    # Same order as the renderer: colour, any local effect covering frame m
+    # (a zoom over a transition zooms the blend), captions, progress bar.
     lines = [
         "[0:v:0]%s[a]" % piece,
         "[1:v:0]%s[b]" % piece,
-        "[a][b]xfade=transition=%s:duration=%.9f:offset=0,select='eq(n\\,%d)'%s[t0]"
-        % (
-            cur["trans_in_type"],
-            float(core.frame_time(d, fps)),
-            k,
-            "".join("," + f for f in ctx.color),
-        ),
+        "[a][b]xfade=transition=%s:duration=%.9f:offset=0,select='eq(n\\,%d)'[t0]"
+        % (cur["trans_in_type"], float(core.frame_time(d, fps)), k),
     ]
-    label = "t0"
-    for e in ctx.effects:
-        if "out_start_frame" in e and e["out_start_frame"] <= m < e["out_end_frame"]:
-            nxt = "t%d" % (len(lines))
-            lines.append(
-                fx.local_effect_graph(e, ctx.size, label, nxt, ctx.tmp, enable=False)
-            )
-            label = nxt
-    post = []
-    if ctx.cap_filter:
-        post += ["setpts=%.9f/TB" % float(core.frame_time(m, fps)), ctx.cap_filter]
+    active = [
+        e
+        for e in ctx.effects
+        if "out_start_frame" in e and e["out_start_frame"] <= m < e["out_end_frame"]
+    ]
+    chain, label = ctx.fx_chain("t0", m, active)
+    lines += chain
     lines.append(
-        "[%s]%sscale=%d:%d:flags=area,format=gray[o]"
-        % (label, "".join(f + "," for f in post), core.THUMB_W, core.THUMB_H)
+        "[%s]scale=%d:%d:flags=area,format=gray[o]"
+        % (label, core.THUMB_W, core.THUMB_H)
     )
     graph = ";".join(lines)
     cmd += [
@@ -742,6 +850,30 @@ def verify(plan, out_path, max_cuts=50, check_loudness=True):
         )
 
     cut_rows, fx_rows = [], {}
+    if plan["has_audio"] and a and fx.sfx_effects(plan.get("effects") or []):
+        with tempfile.TemporaryDirectory() as tmp:
+            sfx_rows = verify_sfx(plan, out_path, tmp)
+        fx_rows["sfx"] = sfx_rows
+        bad = [r for r in sfx_rows if r["status"] == "FAIL"]
+        lags = [
+            abs(r["lag_ms"])
+            for r in sfx_rows
+            if "lag_ms" in r and r["status"] == "PASS"
+        ]
+        _check(
+            rows,
+            "SFX_ALIGN",
+            not bad,
+            "%d sound effects located: %d on their frame (worst %s ms), %d masked, "
+            "%d wrong"
+            % (
+                len(sfx_rows),
+                len(lags),
+                max(lags) if lags else "n/a",
+                sum(1 for r in sfx_rows if r["status"] == "AMBIGUOUS"),
+                len(bad),
+            ),
+        )
     if plan["has_video"] and v and max_cuts != 0:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = _Ctx(plan, tmp)

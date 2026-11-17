@@ -58,6 +58,27 @@ crossfade covers exactly the same samples. `video_verify` then proves the stylin
 - **Captions:** burned captions are re-rendered onto source frames at the matching time and compared.
 - **Fades:** the first and last frames are checked for black.
 
+## Reels, Shorts and TikTok
+
+Ask for a reel ("make this a punchy reel with my music") and the agent runs
+`video_viral_plan`, then plans, renders and verifies it, then scores it with
+`video_retention_audit`.
+
+| Step | What it does |
+|---|---|
+| Hook | First word on frame 1, a title card from the first sentence, a flash and an impact sound |
+| Pace | Jump cuts on every pause above the intensity's threshold (0.40 / 0.22 / 0.14 s) |
+| Rhythm | Framing alternates wide/tight so the frame never sits still longer than 4 / 2.5 / 1.6 s |
+| Emphasis | Punch-ins and pops on numbers and power words; black-and-white hits on negative words (insane) |
+| CTA | The sentence opening with "tap", "follow", "comment"… gets the tightest framing and a ding |
+| Finish | Word-by-word karaoke captions, a progress bar, a ducked music bed, a hard loop ending |
+
+The sound effects are synthesized in code: whoosh, boom, bass drop, pop, click, ding, riser
+and camera. Each is levelled against the normalised voice, and `video_verify` locates it in the
+output by cross-correlation (`SFX_ALIGN`). The audit scores hook speed, hook visual and text, the
+longest still stretch, change rate, captions, length, sound density, CTA and loop. It is honest
+about its limit: pacing keeps viewers watching, but the idea and the first sentence decide reach.
+
 ## Word timestamps
 
 Word-level timestamps enable word-safe cuts, filler removal and captions without the removed

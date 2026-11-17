@@ -91,7 +91,15 @@ def _video_transitions(plan, piece_inputs, geo, deinterlace):
     return lines
 
 
-def _audio_chain(plan, loudnorm_filter, idx=0, music_idx=None, effects=()):
+def _audio_chain(
+    plan,
+    loudnorm_filter,
+    idx=0,
+    music_idx=None,
+    effects=(),
+    sfx_inputs=(),
+    sfx_offset_db=0.0,
+):
     segs = plan["segments"]
     sr = plan["sample_rate"]
     fps = core.to_fraction(plan["fps"])
@@ -205,6 +213,23 @@ def _audio_chain(plan, loudnorm_filter, idx=0, music_idx=None, effects=()):
         else:
             lines.append("[voice][mus]amix=inputs=2:duration=first:normalize=0[mixed]")
         cur = "mixed"
+    if sfx_inputs:
+        # Each effect lands on the sample its output frame starts on. Gains are
+        # set in the pre-normalisation domain (sfx_offset_db) so that, after the
+        # programme is brought to the loudness target, a hit sits at its gain_db.
+        labels = []
+        for n, (sidx, e) in enumerate(sfx_inputs):
+            delay = core.frame_of(core.frame_time(e["out_frame"], fps), 48000)
+            lines.append(
+                "[%d:a:0]aresample=48000,volume=%.2fdB,adelay=delays=%dS:all=1[sfx%d]"
+                % (sidx, e["gain_db"] + sfx_offset_db, delay, n)
+            )
+            labels.append("[sfx%d]" % n)
+        lines.append(
+            "[%s]%samix=inputs=%d:duration=first:normalize=0[withsfx]"
+            % (cur, "".join(labels), len(labels) + 1)
+        )
+        cur = "withsfx"
     tail = []
     if loudnorm_filter:
         tail += [loudnorm_filter, "aresample=48000"]
@@ -286,7 +311,18 @@ def _color_args(plan_src_info, out_height):
     return []
 
 
-def _build(plan, info, preset, deinterlace, lfilter, tmp, measure=False, audio=True):
+def _build(
+    plan,
+    info,
+    preset,
+    deinterlace,
+    lfilter,
+    tmp,
+    measure=False,
+    audio=True,
+    include_sfx=True,
+    sfx_offset_db=0.0,
+):
     """-> (input args, graph). measure=True: audio only; audio=False: video only."""
     src = plan["source"]
     fps = core.to_fraction(plan["fps"])
@@ -320,7 +356,20 @@ def _build(plan, info, preset, deinterlace, lfilter, tmp, measure=False, audio=T
             audio_idx = add(["-i", src])
         music = fx.music_effect(effects)
         music_idx = add(["-stream_loop", "-1", "-i", music["file"]]) if music else None
-        graph.append(_audio_chain(plan, lfilter, audio_idx, music_idx, effects))
+        sfx_inputs = []
+        if include_sfx:
+            cache = {}
+            for e in fx.sfx_effects(effects):
+                if e["sound"] not in cache:
+                    cache[e["sound"]] = fx.synth_sfx(
+                        e["sound"], os.path.join(tmp, "sfx_%s.wav" % e["sound"])
+                    )
+                sfx_inputs.append((add(["-i", cache[e["sound"]]]), e))
+        graph.append(
+            _audio_chain(
+                plan, lfilter, audio_idx, music_idx, effects, sfx_inputs, sfx_offset_db
+            )
+        )
     return [a for arg in inputs for a in arg], ";\n".join(graph)
 
 
@@ -372,8 +421,17 @@ def render(
     lcfg = plan["audio"].get("loudness") or {}
     with tempfile.TemporaryDirectory() as tmp:
         if has_a and loudness and lcfg:
+            # Measured without sound effects: their level is set relative to
+            # this programme, not the other way round.
             in_args, graph = _build(
-                plan, info, preset, deinterlace, _loudnorm(lcfg), tmp, measure=True
+                plan,
+                info,
+                preset,
+                deinterlace,
+                _loudnorm(lcfg),
+                tmp,
+                measure=True,
+                include_sfx=False,
             )
             gpath = os.path.join(tmp, "measure.txt")
             with open(gpath, "w") as fh:
@@ -425,8 +483,20 @@ def render(
                             },
                         )
                         report["loudness_mode"] = "linear"
+                sfx_offset = (
+                    float(measured["input_i"]) - i_target
+                    if (measured and loudness and lcfg)
+                    else 0.0
+                )
                 in_args, agraph = _build(
-                    plan, info, preset, deinterlace, lfilter, tmp, measure=True
+                    plan,
+                    info,
+                    preset,
+                    deinterlace,
+                    lfilter,
+                    tmp,
+                    measure=True,
+                    sfx_offset_db=sfx_offset,
                 )
                 apath = os.path.join(tmp, "audio.txt")
                 with open(apath, "w") as fh:

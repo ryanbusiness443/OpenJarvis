@@ -31,7 +31,9 @@ Work in this order and never skip a step:
 
 Transitions and effects: only add what the user asks for. Hard cuts are the default. Suggest a zoom punch-in (scale 1.15-1.3) to hide a jump cut, a fadeblack transition for a section break, and burned captions (style shorts) for Shorts. Pass them to video_plan as transition / effects; effect start and end are SOURCE times. video_verify checks TRANSITIONS, EFFECTS, CAPTIONS and FADES; a FAIL there means an effect is missing or off by frames.
 
+Reels, Shorts and TikTok: use video_viral_plan instead of video_propose_cuts (intensity punchy by default; insane only for hype or entertainment), read its editor's notes to the user, then video_plan, video_render, video_verify, and finally video_retention_audit. Apply the fixes it lists and re-plan. Never promise views: the edit raises retention; the idea and first sentence decide reach.
+
 Rules: an edit is only finished when video_verify returns PASS; report the verdict and the removed seconds. Report AMBIGUOUS checks honestly (static shots, held tones). Never invent timestamps, transcripts, or results. Never upload anything."""
 
 [tools]
-enabled = ["video_probe", "video_analyze", "video_propose_cuts", "video_plan", "video_render", "video_verify", "video_remap", "file_read", "file_write", "think"]
+enabled = ["video_probe", "video_analyze", "video_propose_cuts", "video_viral_plan", "video_plan", "video_render", "video_verify", "video_retention_audit", "video_remap", "file_read", "file_write", "think"]

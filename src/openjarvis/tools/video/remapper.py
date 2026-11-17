@@ -286,7 +286,7 @@ def _wrap(words, max_chars):
     return lines
 
 
-def cues_from_words(
+def word_groups(
     plan,
     words,
     max_chars=42,
@@ -295,11 +295,12 @@ def cues_from_words(
     gap_s=Fraction(3, 5),
     sentence_breaks=True,
 ):
-    """Build caption cues from kept words only (removed fillers leave the text).
+    """Group kept words into caption cues on the output timeline.
 
-    A cue ends at a pause, at max_s, when the next word would need another line,
-    or (sentence_breaks) after a word ending a sentence, so cues never straddle
-    two sentences or leave a lone word on a third line.
+    Returns [[(out_start, out_end, word), ...], ...]. A group ends at a pause,
+    at max_s, when the next word would need another line, or (sentence_breaks)
+    after a word ending a sentence; a connecting word ("of", "the") is carried
+    into the next group rather than left dangling.
     """
     tl = Timeline(plan)
     kept = []
@@ -313,17 +314,11 @@ def cues_from_words(
         kept.append(
             (oa if oa is not None else o, (ob if ob is not None else o), w["word"])
         )
-    cues, cur = [], []
+    groups, cur = [], []
 
     def flush():
         if cur:
-            cues.append(
-                (
-                    cur[0][0],
-                    cur[-1][1],
-                    "\n".join(_wrap([x[2] for x in cur], max_chars)),
-                )
-            )
+            groups.append(list(cur))
             cur.clear()
 
     for a, b, word in kept:
@@ -334,18 +329,34 @@ def cues_from_words(
             if a - cur[-1][1] > gap_s:
                 flush()
             elif b - cur[0][0] > max_s or too_many_lines:
-                # Never end a cue on a connecting word ("the founder of / RWM"):
-                # carry it into the next cue with the word it introduces.
                 carry = []
                 while len(cur) > 1 and cur[-1][2].lower().strip(",") in _WEAK_ENDINGS:
                     carry.insert(0, cur.pop())
                 flush()
                 cur.extend(carry)
         cur.append((a, b, word))
-        if sentence_breaks and word.rstrip("\"'”)").endswith((".", "?", "!")):
+        if sentence_breaks and word.rstrip("\"'\u201d)").endswith((".", "?", "!")):
             flush()
     flush()
-    return cues
+    return groups
+
+
+def cues_from_words(
+    plan,
+    words,
+    max_chars=42,
+    max_lines=2,
+    max_s=Fraction(6),
+    gap_s=Fraction(3, 5),
+    sentence_breaks=True,
+):
+    """Build caption cues from kept words only (removed fillers leave the text)."""
+    return [
+        (g[0][0], g[-1][1], "\n".join(_wrap([x[2] for x in g], max_chars)))
+        for g in word_groups(
+            plan, words, max_chars, max_lines, max_s, gap_s, sentence_breaks
+        )
+    ]
 
 
 def write_srt(cues, path=None):

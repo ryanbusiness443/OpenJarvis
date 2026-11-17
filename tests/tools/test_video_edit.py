@@ -443,3 +443,130 @@ class TestTransitionsAndEffectsEndToEnd:
                 eff["out_end_frame"] += 2
         bad = verifier.verify(moved, str(out), check_loudness=False)
         assert "EFFECTS" in bad["failed"]
+
+
+# ---------------------------------------------------------------- reels mode
+
+REEL_WORDS = [
+    ("Stop", 0.30, 0.55),
+    ("making", 0.58, 0.90),
+    ("this", 0.92, 1.10),
+    ("mistake.", 1.12, 1.70),
+    ("Here", 3.30, 3.50),
+    ("are", 3.52, 3.62),
+    ("three", 3.64, 3.95),
+    ("fixes", 3.97, 4.40),
+    ("that", 4.42, 4.55),
+    ("work.", 4.57, 4.95),
+    ("Follow", 6.00, 6.35),
+    ("for", 6.37, 6.50),
+    ("more.", 6.52, 7.00),
+]
+
+
+def _reel_words(tmp_path):
+    p = tmp_path / "words.json"
+    p.write_text(
+        json.dumps([{"word": w, "start": a, "end": b} for w, a, b in REEL_WORDS])
+    )
+    return p
+
+
+class TestViralPlanner:
+    def _plan(self, intensity):
+        from openjarvis.tools.video import viral
+
+        ws = [
+            {"word": w, "start": Fraction(str(a)), "end": Fraction(str(b))}
+            for w, a, b in REEL_WORDS
+        ]
+        return viral.plan_viral("x.mp4", ws, intensity, "short", duration=Fraction(8))
+
+    def test_intensity_tightens_pacing(self):
+        clean, _, _ = self._plan("clean")
+        insane, _, _ = self._plan("insane")
+        assert len(insane) >= len(clean)
+
+    def test_hook_cta_and_loop(self):
+        cuts, effects, notes = self._plan("punchy")
+        kinds = [e["type"] for e in effects]
+        assert "text" in kinds and "flash" in kinds and "captions" in kinds
+        assert any(e.get("sound") == "ding" for e in effects)  # "Follow for more."
+        assert any("loops" in n for n in notes)
+        assert "fade_out" not in kinds
+        assert cuts[0]["start"] == "0"  # lead-in silence removed
+
+    def test_mid_sentence_buy_is_not_a_cta(self):
+        from openjarvis.tools.video import viral
+
+        ws = [
+            {"word": w, "start": Fraction(a), "end": Fraction(b)}
+            for w, a, b in [
+                ("Hello", "0.1", "0.4"),
+                ("there.", "0.4", "0.8"),
+                ("People", "1.0", "1.3"),
+                ("want", "1.3", "1.5"),
+                ("to", "1.5", "1.6"),
+                ("buy.", "1.6", "1.9"),
+                ("Tap", "2.2", "2.4"),
+                ("the", "2.4", "2.5"),
+                ("link.", "2.5", "2.9"),
+            ]
+        ]
+        _, effects, notes = viral.plan_viral(
+            "x.mp4", ws, "punchy", "short", duration=Fraction(3)
+        )
+        cta = [n for n in notes if n.startswith("CTA")]
+        assert cta and "'Tap'" in cta[0]
+
+    def test_sfx_density_is_capped(self):
+        # Distinct hits (not layered on the same instant) stay >= 0.8 s apart.
+        _, effects, _ = self._plan("insane")
+        times = sorted(
+            {core.parse_time(e["at"]) for e in effects if e["type"] == "sfx"}
+        )
+        gaps = [b - a for a, b in zip(times, times[1:]) if b - a >= Fraction(1, 20)]
+        assert gaps and all(g >= Fraction(4, 5) for g in gaps)
+
+
+@needs_ffmpeg
+class TestReelEndToEnd:
+    def test_viral_plan_render_verify_audit(self, sample_clip, tmp_path):
+        from openjarvis.tools.video_edit import (
+            VideoRetentionAuditTool,
+            VideoViralPlanTool,
+        )
+
+        words = _reel_words(tmp_path)
+        edl = tmp_path / "reel.edl.json"
+        planned = VideoViralPlanTool(allowed_dirs=[]).execute(
+            path=sample_clip,
+            words_path=str(words),
+            edl_out=str(edl),
+            intensity="insane",
+        )
+        assert planned.success, planned.content
+        plan_path = tmp_path / "reel.plan.json"
+        res = VideoPlanTool(allowed_dirs=[]).execute(
+            edl_path=str(edl), plan_out=str(plan_path), preset="draft"
+        )
+        assert res.success, res.content
+        out = tmp_path / "reel.mp4"
+        rendered = VideoRenderTool(allowed_dirs=[]).execute(
+            plan_path=str(plan_path), output_path=str(out)
+        )
+        assert rendered.success, rendered.content
+        verified = VideoVerifyTool(allowed_dirs=[]).execute(
+            plan_path=str(plan_path), output_path=str(out)
+        )
+        assert verified.success, verified.content
+        statuses = {
+            r["check"]: r["status"] for r in verified.metadata["report"]["checks"]
+        }
+        assert statuses["SFX_ALIGN"] == "PASS"
+        assert statuses["EFFECTS"] == "PASS"
+        audit = VideoRetentionAuditTool(allowed_dirs=[]).execute(
+            plan_path=str(plan_path)
+        )
+        assert audit.success
+        assert audit.metadata["report"]["score"] >= 75
